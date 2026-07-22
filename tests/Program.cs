@@ -5,6 +5,22 @@ using System.Text.Json;
 using LilithAI;
 
 AiReply.SelfTest();
+var configTestDirectory = Path.Combine(Path.GetTempPath(), $"LilithAI-config-{Guid.NewGuid():N}");
+Directory.CreateDirectory(configTestDirectory);
+try
+{
+    var legacyConfig = Path.Combine(configTestDirectory, ConfigMigration.LegacyFileName);
+    File.WriteAllText(legacyConfig, "ApiKey = preserved");
+    var migratedConfig = ConfigMigration.Prepare(configTestDirectory);
+    if (Path.GetFileName(migratedConfig) != ConfigMigration.FileName ||
+        !File.Exists(migratedConfig) || File.Exists(legacyConfig) ||
+        File.ReadAllText(migratedConfig) != "ApiKey = preserved")
+        throw new InvalidOperationException("Config filename migration self-test failed");
+}
+finally
+{
+    Directory.Delete(configTestDirectory, true);
+}
 if (UiMath.MouseWheelDelta(120L << 16) != 120 ||
     UiMath.MouseWheelDelta((long)unchecked((ushort)(short)-120) << 16) != -120 ||
     UiMath.ClampScrollOffset(-10f, 300f, 100f) != 0f ||

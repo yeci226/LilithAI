@@ -23,7 +23,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string Guid = "tw.shawn.lilith.ai";
     public const string Name = "Lilith AI";
-    public const string Version = "0.10.19";
+    public const string Version = "0.10.20";
 
     internal static ManualLogSource LogSource { get; private set; } = null!;
 
@@ -31,10 +31,21 @@ public sealed class Plugin : BasePlugin
     {
         LogSource = Log;
         AiReply.SelfTest();
+        string configPath;
+        try
+        {
+            configPath = ConfigMigration.Prepare(Paths.ConfigPath);
+        }
+        catch (Exception exception)
+        {
+            configPath = Path.Combine(Paths.ConfigPath, ConfigMigration.LegacyFileName);
+            Log.LogWarning($"Could not rename the settings file to {ConfigMigration.FileName}: {exception.Message}");
+        }
         var controller = AddComponent<Controller>();
-        controller.Initialize(new ModSettings(Config));
+        controller.Initialize(new ModSettings(new ConfigFile(configPath, true)));
 
         Log.LogInfo($"{Name} {Version} loaded");
+        Log.LogInfo($"Settings file: {configPath}");
         Log.LogInfo("Windows tray settings integration enabled");
     }
 }

@@ -57,7 +57,7 @@ BepInEx\plugins\LilithAI.dll
 
 ## 使用提醒
 
-- API key 只保存在 `BepInEx/config/tw.shawn.lilith.ai.cfg`。
+- API key 只保存在 `BepInEx/config/LilithAI.cfg`；舊設定檔會在首次啟動時自動改名。
 - 對話記憶保存在 `BepInEx/data/LilithAI/memory.json`。
 - `BepInEx/LogOutput.log` 可能包含對話內容；回報問題前請先檢查。
 - 玩家名稱預設不會傳給模型，可在 `Context.IncludePlayerName` 自行開啟。

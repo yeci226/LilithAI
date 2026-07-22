@@ -57,7 +57,7 @@ To update, close the game and overwrite the old files with the new ZIP. Your set
 
 ## Notes
 
-- Your API key is stored only in `BepInEx/config/tw.shawn.lilith.ai.cfg`.
+- Your API key is stored only in `BepInEx/config/LilithAI.cfg`; the old settings file is renamed automatically on first launch.
 - Conversation history is stored in `BepInEx/data/LilithAI/memory.json`.
 - `BepInEx/LogOutput.log` may contain conversation text. Review it before sharing a bug report.
 - The player name is not sent by default. You can enable it with `Context.IncludePlayerName`.

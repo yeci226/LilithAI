@@ -23,7 +23,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string Guid = "tw.shawn.lilith.ai";
     public const string Name = "Lilith AI";
-    public const string Version = "0.10.18";
+    public const string Version = "0.10.19";
 
     internal static ManualLogSource LogSource { get; private set; } = null!;
 
@@ -809,6 +809,17 @@ public sealed class Controller : MonoBehaviour
             if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri) || !endpointUri.IsLoopback)
                 throw new InvalidOperationException("TTS endpoint must use localhost.");
             var executable = japanese ? _settings.IrodoriPythonPath : _settings.ChineseVoiceHostPath;
+            var irodoriRoot = japanese
+                ? Path.GetFullPath(Path.Combine(Path.GetDirectoryName(executable)!, "..", ".."))
+                : string.Empty;
+            var bundledPythonRoot = japanese
+                ? Path.Combine(Path.GetDirectoryName(irodoriRoot)!, ".uv-python")
+                : string.Empty;
+            var bundledPython = Directory.Exists(bundledPythonRoot)
+                ? Directory.EnumerateFiles(bundledPythonRoot, "python.exe", SearchOption.AllDirectories).FirstOrDefault()
+                : null;
+            if (bundledPython != null)
+                executable = bundledPython;
             if (!File.Exists(executable))
             {
                 Plugin.LogSource.LogInfo($"{_voiceMode} TTS runtime is not installed: {executable}");
@@ -829,16 +840,20 @@ public sealed class Controller : MonoBehaviour
                 Arguments = japanese
                     ? $"-m irodori_openai_tts --host 127.0.0.1 --port {endpointUri.Port}"
                     : $"--voice-host --parent {Environment.ProcessId} --language zh",
-                WorkingDirectory = japanese
-                    ? Path.GetFullPath(Path.Combine(Path.GetDirectoryName(executable)!, "..", ".."))
-                    : Path.GetDirectoryName(executable)!,
+                WorkingDirectory = japanese ? irodoriRoot : Path.GetDirectoryName(executable)!,
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
             };
             var bundledDotnet = Path.Combine(Paths.GameRootPath, "dotnet");
             if (japanese)
+            {
                 startInfo.Environment["HF_HOME"] = Path.Combine(Path.GetDirectoryName(startInfo.WorkingDirectory)!, ".hf-cache");
+                if (bundledPython != null)
+                    startInfo.Environment["PYTHONPATH"] = string.Join(Path.PathSeparator,
+                        Path.Combine(irodoriRoot, ".venv", "Lib", "site-packages"),
+                        Path.Combine(irodoriRoot, "src"));
+            }
             if (!japanese)
             {
                 startInfo.Environment["PYTHONIOENCODING"] = "utf-8";

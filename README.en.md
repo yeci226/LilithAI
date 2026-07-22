@@ -20,22 +20,24 @@ LilithAI adds AI chat to the game's existing interaction menu, remembers recent 
 
 ## Download
 
-Choose one package from [Releases](../../releases/latest):
+Download the base package from [Releases](../../releases/latest), then add the voice packages you want:
 
-| Package | Includes |
+| Voice setup | Downloads |
 | --- | --- |
-| `LilithAI-vX.Y.Z-text.zip` | Text chat only; no extra model or GPU required |
-| `LilithAI-vX.Y.Z-text+voice.zip` | Text chat and local Chinese speech; about 2 GB, with 8 GB VRAM and 16 GB RAM recommended |
+| None | `base.zip` |
+| Chinese | `base.zip` + `voice-chinese.zip` |
+| Japanese | `base.zip` + every `voice-japanese-*.zip` |
+| Chinese + Japanese | `base.zip` + `voice-chinese.zip` + every `voice-japanese-*.zip` |
 
-Both packages already include the required BepInEx files. There is nothing else to download.
+Extract every ZIP directly beside `Lilith.exe`. The Japanese runtime is split because GitHub limits each release asset to 2 GiB. The base package includes BepInEx.
 
 ## Installation
 
 1. Close the game.
-2. Download either the text or text + voice package.
-3. **Extract** the ZIP into the Steam game directory—the folder containing `Lilith.exe`.
+2. Download the base package and the voice packages listed above.
+3. **Extract every ZIP** into the Steam game directory—the folder containing `Lilith.exe`.
 4. Start the game. The first launch takes longer while BepInEx creates its files.
-5. Open the `Lilith AI` tab in the game settings, choose a provider and model, then enter your API key. For the voice package, set Voice to `Chinese`.
+5. Open the `Lilith AI` tab in the game settings, choose a provider, model, and voice, then enter your API key. The Japanese model takes longer on its first load.
 
 The default Steam path is usually:
 
@@ -59,7 +61,7 @@ To update, close the game and overwrite the old files with the new ZIP. Your set
 - Conversation history is stored in `BepInEx/data/LilithAI/memory.json`.
 - `BepInEx/LogOutput.log` may contain conversation text. Review it before sharing a bug report.
 - The player name is not sent by default. You can enable it with `Context.IncludePlayerName`.
-- Dynamic Japanese speech requires a separate [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server) installation.
+- Chinese speech uses GPT-SoVITS; Japanese speech uses [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server).
 
 ## Build from source
 

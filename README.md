@@ -1,63 +1,67 @@
 # LilithAI
 
-![LilithAI 展示圖，請替換成遊戲實拍](docs/images/hero-placeholder.svg)
+**繁體中文** · [简体中文](README.zh-CN.md) · [English](README.en.md) · [日本語](README.ja.md)
+
+<p align="center">
+  <img src="docs/images/hero.png" width="620" alt="LilithAI 對話輸入畫面">
+</p>
 
 讓《The NOexistenceN of Lilith》裡的莉莉絲陪你多聊一會。
 
-LilithAI 是 Windows 版的 BepInEx IL2CPP 外掛。它把 AI 對話接進遊戲原本的互動選單，保留最近的談話脈絡，也能讓回覆帶動莉莉絲的表情與動作。你可以使用 OpenAI、Anthropic、Gemini、xAI、DeepSeek、Mistral、OpenRouter，或留在本機的 Ollama、LM Studio。
+LilithAI 把 AI 對話接進遊戲原本的互動選單，保留最近的談話脈絡，也能讓回覆帶動莉莉絲的表情與動作。支援 OpenAI、Anthropic、Gemini、xAI、DeepSeek、Mistral、OpenRouter，以及本機的 Ollama、LM Studio。
 
-> 這是非官方模組，與遊戲開發者及發行商無關。請先備份重要存檔。
+> 這是非官方模組，與遊戲開發者及發行商無關。
 
-## 畫面預覽
+## 畫面
 
 | 對話 | 設定 |
 | --- | --- |
-| ![對話展示圖 placeholder](docs/images/chat-placeholder.svg) | ![設定展示圖 placeholder](docs/images/settings-placeholder.svg) |
+| ![莉莉絲 AI 對話](docs/images/chat.png) | ![Lilith AI 設定](docs/images/settings.png) |
 
-替換 `docs/images/` 內三張同名圖片即可更新 README 展示圖；建議 hero 使用 1600×900，其餘兩張使用 1200×750。
+## 下載
 
-## 下載哪一版
+在 [Releases](../../releases/latest) 選擇一個版本：
 
-| 版本 | 適合誰 | 內容 |
-| --- | --- | --- |
-| `LilithAI-vX.Y.Z-text.zip` | 只想聊天、不想跑本機語音 | 外掛本體；不需要額外 GPU 或模型 |
-| `LilithAI-vX.Y.Z-voice.zip` | 想讓中文回覆唸出來 | 外掛本體與中文語音安裝器；安裝時另下載約 2 GB runtime |
+| 安裝包 | 內容 |
+| --- | --- |
+| `LilithAI-vX.Y.Z-text.zip` | 純文字聊天，不需要額外模型或 GPU |
+| `LilithAI-vX.Y.Z-text+voice.zip` | 文字聊天＋中文本機語音，約 2 GB，建議 8 GB VRAM、16 GB RAM |
 
-兩版使用同一個 DLL。純文字版之後也能直接覆蓋成語音版，不會清除設定或對話記憶。
+兩個安裝包都已包含所需的 BepInEx，不必另外下載。
 
 ## 安裝
 
-1. 安裝 [BepInEx 6 IL2CPP Windows x64](https://docs.bepinex.dev/master/articles/user_guide/installation/unity_il2cpp.html)，解壓到 `Lilith.exe` 所在資料夾。
-2. 啟動遊戲一次，等 BepInEx 完成首次初始化後關閉遊戲。
-3. 從 [Releases](../../releases/latest) 下載需要的 LilithAI 版本，直接解壓到 `Lilith.exe` 所在資料夾。
-4. 語音版再執行 `Install-Chinese-Voice.cmd`。安裝器會下載、校驗並安裝中文語音 runtime。
-5. 進入遊戲設定的 `Lilith AI` 分頁，選擇服務、模型並填入 API key；使用語音版時把語音切換成 `中文`。
+1. 關閉遊戲。
+2. 下載純文字版或文字＋語音版。
+3. 將 ZIP **解壓縮**到 Steam 的遊戲安裝目錄，也就是 `Lilith.exe` 所在資料夾。
+4. 啟動遊戲。第一次啟動需要產生 BepInEx 檔案，等待時間會比平常久。
+5. 進入遊戲設定的 `Lilith AI` 分頁，選擇服務、模型並填入 API key。語音版請把語音切換成 `中文`。
 
-更新時只要關閉遊戲，再用新版 ZIP 覆蓋即可。設定保存在 `BepInEx/config/tw.shawn.lilith.ai.cfg`，對話記憶保存在 `BepInEx/data/LilithAI/memory.json`。
+預設 Steam 路徑通常是：
 
-## 日文語音
-
-日文動態語音使用 [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server)，模型環境沒有放進發布包。先在 `BepInEx/data/LilithTextInjector/voice-runtime` 完成其 Windows 安裝，再於遊戲設定選擇 `日文`：
-
-```powershell
-git clone https://github.com/Aratako/Irodori-TTS-Server.git
-Set-Location .\Irodori-TTS-Server
-uv sync --extra cu128
-Copy-Item .env.example .env
+```text
+C:\Program Files (x86)\Steam\steamapps\common\The NOexistenceN of Lilith
 ```
 
-中文或日文語音建議使用 8 GB VRAM、16 GB RAM；CPU 可以執行，但等待時間會比較長。語音端點只接受 localhost，參考音檔路徑與自動啟動選項可在設定檔的 `TTS` 區段調整。
+解壓後應該能在遊戲目錄看到：
+
+```text
+Lilith.exe
+winhttp.dll
+BepInEx\plugins\LilithAI.dll
+```
+
+更新時關閉遊戲，再用新版 ZIP 覆蓋即可。設定與對話記憶不會被安裝包清除。
 
 ## 使用提醒
 
-- API key 只寫入本機 BepInEx 設定檔，不會出現在 LilithAI 的診斷紀錄。
-- `BepInEx/LogOutput.log` 會記錄請求、回覆與解析結果，方便除錯，但其中可能包含你的對話；回報問題前請先檢查內容。
-- 玩家名稱預設不會傳給模型，可在設定檔的 `Context.IncludePlayerName` 自行開啟。
-- 選擇 Ollama 或 LM Studio 時，模型與對話都能留在本機。
+- API key 只保存在 `BepInEx/config/tw.shawn.lilith.ai.cfg`。
+- 對話記憶保存在 `BepInEx/data/LilithAI/memory.json`。
+- `BepInEx/LogOutput.log` 可能包含對話內容；回報問題前請先檢查。
+- 玩家名稱預設不會傳給模型，可在 `Context.IncludePlayerName` 自行開啟。
+- 日文動態語音需要另外安裝 [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server)。
 
 ## 自行建置
-
-需要 .NET SDK，以及已完成首次啟動的 BepInEx 遊戲目錄：
 
 ```powershell
 dotnet build .\LilithAI.sln -c Release -p:GameDir="D:\SteamLibrary\steamapps\common\The NOexistenceN of Lilith"
@@ -66,12 +70,12 @@ dotnet run --project .\tests\LilithAISmoke.csproj -c Release --no-build
 .\scripts\Build-Release.ps1
 ```
 
-`Build-Release.ps1` 會在 `release-assets/output/` 產生兩個發布 ZIP 與 SHA-256 清單。
+發布包會產生在 `release-assets/output/`。
 
 ## 致謝
 
-- [BepInEx](https://github.com/BepInEx/BepInEx) 提供 Unity IL2CPP 外掛載入環境。
-- 中文 GPT-SoVITS runtime 與參考素材來自 [Lilith-AI-Mod](https://github.com/mimimi6666/Lilith-AI-Mod) 的公開發布檔。
-- 日文語音由 [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server) 提供。
+- [BepInEx](https://github.com/BepInEx/BepInEx)
+- [Lilith-AI-Mod](https://github.com/mimimi6666/Lilith-AI-Mod) 的中文 GPT-SoVITS runtime 與參考素材
+- [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server)
 
 遊戲名稱、角色與素材版權屬原權利人所有。

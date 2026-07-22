@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="750" viewBox="0 0 1200 750">
+  <rect width="1200" height="750" fill="#18151d"/>
+  <rect x="42" y="42" width="1116" height="666" rx="22" fill="none" stroke="#a98b9c" stroke-width="3" stroke-dasharray="12 12"/>
+  <text x="600" y="350" text-anchor="middle" fill="#eee5ea" font-family="Segoe UI, sans-serif" font-size="42">對話畫面</text>
+  <text x="600" y="405" text-anchor="middle" fill="#a98b9c" font-family="Segoe UI, sans-serif" font-size="23">替換 chat-placeholder.svg</text>
+</svg>

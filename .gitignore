@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+release-assets/packages/
+release-assets/output/
+release-assets/stage/
+deploy-verification/

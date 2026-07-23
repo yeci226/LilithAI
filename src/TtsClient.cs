@@ -33,6 +33,9 @@ public static class TtsClient
 {
     public const int VoicePlaybackDelayFrames = 2;
 
+    public static bool ShouldRestartInterruptedPlayback(bool playingExpectedClip, float remainingSeconds, bool alreadyRetried) =>
+        !playingExpectedClip && remainingSeconds > 0.1f && !alreadyRetried;
+
     public static bool ShouldStopLocalVoiceHosts(VoiceMode mode, bool autoStart) =>
         mode == VoiceMode.Off || !autoStart;
 
@@ -74,7 +77,8 @@ public static class TtsClient
         if (mode == VoiceMode.Off || !string.IsNullOrWhiteSpace(reply.Speech))
             return mode == VoiceMode.Off ? reply.Text : reply.Speech;
 
-        return mode == VoiceMode.Japanese || displayLanguage is "zh-Hant" or "zh-Hans"
+        return mode == VoiceMode.Chinese && displayLanguage is "zh-Hant" or "zh-Hans" ||
+               mode == VoiceMode.Japanese && displayLanguage == "ja"
             ? reply.Text
             : string.Empty;
     }
@@ -86,10 +90,14 @@ public static class TtsClient
         if (textParts.Length <= 1 || textParts.Length != speechParts.Length)
             return new[] { reply };
 
+        var inlineActions = reply.InlineActions.Length == textParts.Length ? reply.InlineActions : null;
         return textParts.Select((text, index) => new AiReply(
             text,
-            index == 0 ? reply.Action : "None",
-            string.IsNullOrWhiteSpace(reply.Speech) ? string.Empty : speechParts[index])).ToArray();
+            inlineActions?[index] ?? (index == 0 ? reply.Action : "None"),
+            string.IsNullOrWhiteSpace(reply.Speech) ? string.Empty : speechParts[index],
+            index == 0 ? reply.Clothing : "None",
+            index == 0 ? reply.Command : "None",
+            index == 0 ? reply.Argument : string.Empty)).ToArray();
     }
 
     private static string[] SplitLines(string text) => text

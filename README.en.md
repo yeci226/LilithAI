@@ -8,7 +8,7 @@
 
 Spend a little more time talking with Lilith in *The NOexistenceN of Lilith*.
 
-LilithAI adds AI chat to the game's existing interaction menu, remembers recent conversation context, and lets replies trigger Lilith's expressions and actions. It supports OpenAI, Anthropic, Gemini, xAI, DeepSeek, Mistral, OpenRouter, and local Ollama or LM Studio servers.
+LilithAI adds AI chat to the game's existing interaction menu, remembers recent conversation context, and lets replies trigger Lilith's expressions and built-in controls: outfits, timers, alarms, Pomodoro, music, owned accessories, quiet/recall, and sitting, lying down, sleeping, or waking. It supports OpenAI, Anthropic, Gemini, xAI, DeepSeek, Mistral, OpenRouter, and local Ollama or LM Studio servers.
 
 > This is an unofficial mod and is not affiliated with the game's developer or publisher.
 
@@ -20,16 +20,16 @@ LilithAI adds AI chat to the game's existing interaction menu, remembers recent 
 
 ## Download
 
-Download the base package from [Releases](../../releases/latest), then add the voice packages you want:
+Download the text package from the [latest Release](../../releases/latest). If wanted, add the reusable [v0.10.20 voice add-ons](../../releases/tag/v0.10.20):
 
 | Voice setup | Downloads |
 | --- | --- |
-| None | `base.zip` |
-| Chinese | `base.zip` + `voice-chinese.zip` |
-| Japanese | `base.zip` + every `voice-japanese-*.zip` |
-| Chinese + Japanese | `base.zip` + `voice-chinese.zip` + every `voice-japanese-*.zip` |
+| None | latest `text.zip` |
+| Chinese | latest `text.zip` + `v0.10.20-voice-chinese.zip` |
+| Japanese | latest `text.zip` + every `v0.10.20-voice-japanese-*.zip` |
+| Chinese + Japanese | latest `text.zip` + all voice add-ons above |
 
-Extract every ZIP directly beside `Lilith.exe`. The Japanese runtime is split because GitHub limits each release asset to 2 GiB. The base package includes BepInEx.
+Extract every ZIP directly beside `Lilith.exe`. The Japanese runtime is split because GitHub limits each release asset to 2 GiB. The text package includes BepInEx; voice add-ons are republished only when their contents change.
 
 ## Installation
 
@@ -59,6 +59,8 @@ To update, close the game and overwrite the old files with the new ZIP. Your set
 
 - Your API key is stored only in `BepInEx/config/LilithAI.cfg`; the old settings file is renamed automatically on first launch.
 - Conversation history is stored in `BepInEx/data/LilithAI/memory.json`.
+- Important people, preferences, and events are stored in `long-term-memory.json`; both memory files keep a `.bak` and recover automatically if the main file is corrupt.
+- Proactive dialogue is enabled by default with a 30-minute minimum cooldown; configure it with `Companion.ProactiveDialogue` and `Companion.ProactiveCooldownMinutes`.
 - `BepInEx/LogOutput.log` may contain conversation text. Review it before sharing a bug report.
 - The player name is not sent by default. You can enable it with `Context.IncludePlayerName`.
 - Chinese speech uses GPT-SoVITS; Japanese speech uses [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server).

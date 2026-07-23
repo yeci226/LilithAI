@@ -1,6 +1,8 @@
 using System.Net.Http.Headers;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace LilithAI;
 
@@ -153,9 +155,209 @@ public static class ProviderProfiles
 
 public sealed record ChatMessage(string Role, string Content);
 
-public sealed record AiReply(string Text, string Action, string Speech = "")
+public sealed record LongTermMemory(string Text, DateTimeOffset CreatedAt);
+
+public static class LocalJsonFile
 {
+    private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
+
+    public static T? Load<T>(string path, Action<string>? log = null)
+    {
+        try
+        {
+            if (!File.Exists(path))
+                return default;
+            return JsonSerializer.Deserialize<T>(File.ReadAllText(path)) ??
+                   throw new InvalidDataException("JSON contains no data.");
+        }
+        catch (Exception mainException)
+        {
+            var backup = path + ".bak";
+            try
+            {
+                if (!File.Exists(backup))
+                    throw new FileNotFoundException("No backup file exists.", backup);
+                var recovered = JsonSerializer.Deserialize<T>(File.ReadAllText(backup)) ??
+                                throw new InvalidDataException("Backup JSON contains no data.");
+                try
+                {
+                    File.Copy(backup, path, true);
+                }
+                catch (Exception restoreException)
+                {
+                    log?.Invoke($"Loaded {Path.GetFileName(path)} from backup but could not restore the main file: {restoreException.Message}");
+                }
+                log?.Invoke($"Recovered {Path.GetFileName(path)} from backup after: {mainException.Message}");
+                return recovered;
+            }
+            catch (Exception backupException)
+            {
+                log?.Invoke($"Could not load {Path.GetFileName(path)} or its backup: {backupException.Message}");
+                return default;
+            }
+        }
+    }
+
+    public static void Save<T>(string path, T value)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var temporary = path + ".tmp";
+        try
+        {
+            File.WriteAllText(temporary, JsonSerializer.Serialize(value, Options));
+            if (File.Exists(path))
+                File.Copy(path, path + ".bak", true);
+            File.Move(temporary, path, true);
+        }
+        finally
+        {
+            if (File.Exists(temporary))
+                File.Delete(temporary);
+        }
+    }
+}
+
+public static class LongTermMemoryStore
+{
+    public static bool Remember(List<LongTermMemory> memories, string text, DateTimeOffset now)
+    {
+        var normalized = (text ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (normalized.Length == 0)
+            return false;
+        normalized = normalized[..Math.Min(500, normalized.Length)];
+        if (memories.Any(memory => string.Equals(memory.Text, normalized, StringComparison.OrdinalIgnoreCase)))
+            return false;
+        memories.Add(new LongTermMemory(normalized, now));
+        while (memories.Count > 128)
+            memories.RemoveAt(0);
+        return true;
+    }
+
+    public static LongTermMemory[] Search(IEnumerable<LongTermMemory> memories, string query, int count = 5)
+    {
+        var terms = SearchTerms(query).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        return memories
+            .Select(memory => (Memory: memory, Score: terms.Count(term => memory.Text.Contains(term, StringComparison.OrdinalIgnoreCase))))
+            .OrderByDescending(item => item.Score > 0)
+            .ThenByDescending(item => item.Score)
+            .ThenByDescending(item => item.Memory.CreatedAt)
+            .Take(Math.Max(0, count))
+            .Select(item => item.Memory)
+            .ToArray();
+    }
+
+    private static IEnumerable<string> SearchTerms(string text)
+    {
+        var token = new StringBuilder();
+        foreach (var character in text ?? string.Empty)
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                token.Append(char.ToLowerInvariant(character));
+                continue;
+            }
+            foreach (var term in ExpandToken(token.ToString()))
+                yield return term;
+            token.Clear();
+        }
+        foreach (var term in ExpandToken(token.ToString()))
+            yield return term;
+    }
+
+    private static IEnumerable<string> ExpandToken(string token)
+    {
+        if (token.Length >= 2)
+            yield return token;
+        if (token.Any(character => character >= 0x3400) && token.Length > 2)
+            for (var index = 0; index < token.Length - 1; index++)
+                yield return token.Substring(index, 2);
+    }
+}
+
+public enum AiCommandType
+{
+    None,
+    SetTimer,
+    CancelTimer,
+    SetAlarm,
+    CancelAlarm,
+    StartPomodoro,
+    StopPomodoro,
+    PlayMusic,
+    NextMusic,
+    StopMusic,
+    SetGlasses,
+    SetHat,
+    Quiet,
+    Recall,
+    Sit,
+    LieDown,
+    Sleep,
+    Wake,
+    Stand,
+}
+
+public static class AiCommandProtocol
+{
+    public static string ResolveClothing(string userText, string replyText, string aiClothing)
+    {
+        if (string.Equals(aiClothing, "Pajamas", StringComparison.OrdinalIgnoreCase))
+            return "Pajamas";
+        if (string.Equals(aiClothing, "Casual", StringComparison.OrdinalIgnoreCase))
+            return "Casual";
+
+        var requested = RequestedClothing(userText);
+        return requested != "None" && RequestedClothing(replyText) == requested ? requested : "None";
+    }
+
+    private static string RequestedClothing(string text)
+    {
+        var request = (text ?? string.Empty).Trim().ToLowerInvariant();
+        var changeRequested = new[] { "換", "换", "穿上", "換上", "换上", "可以穿", "能穿", "想穿", "請穿", "请穿", "change", "switch", "put on", "wear", "着替", "着て", "変え" }
+            .Any(request.Contains);
+        if (!changeRequested)
+            return "None";
+        if (new[] { "睡衣", "パジャマ", "寝巻", "pajama", "pyjama" }.Any(request.Contains))
+            return "Pajamas";
+        return new[] { "便服", "休閒服", "休闲服", "日常服", "普段着", "私服", "casual" }.Any(request.Contains)
+            ? "Casual"
+            : "None";
+    }
+
+    public static bool TryParseTimerSeconds(string argument, out float seconds)
+    {
+        seconds = 0;
+        if (!int.TryParse(argument, NumberStyles.Integer, CultureInfo.InvariantCulture, out var minutes) || minutes is < 1 or > 1440)
+            return false;
+        seconds = minutes * 60f;
+        return true;
+    }
+
+    public static bool TryParseAlarm(string argument, DateTime now, out DateTime alarm)
+    {
+        if (!DateTime.TryParseExact(argument?.Trim() ?? string.Empty, "yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces, out alarm))
+            return false;
+        return alarm > now && alarm <= now.AddYears(1);
+    }
+}
+
+public sealed record AiReply(
+    string Text,
+    string Action,
+    string Speech = "",
+    string Clothing = "None",
+    string Command = "None",
+    string Argument = "",
+    string Memory = "")
+{
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string[] InlineActions { get; init; } = Array.Empty<string>();
+
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private static readonly Regex InlineActionPattern = new(
+        @"[\uFF08(]\s*(?:\u52D5\u4F5C|\u52A8\u4F5C|action)\s*[\uFF1A:]\s*([A-Za-z]+)\s*[\uFF09)]",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     public static AiReply Parse(string raw)
     {
@@ -167,7 +369,15 @@ public sealed record AiReply(string Text, string Action, string Speech = "")
             {
                 var parsed = JsonSerializer.Deserialize<AiReply>(raw[start..(end + 1)], JsonOptions);
                 if (!string.IsNullOrWhiteSpace(parsed?.Text))
-                    return parsed with { Action = string.IsNullOrWhiteSpace(parsed.Action) ? "None" : parsed.Action };
+                {
+                    var text = StripInlineActions(parsed.Text, out var inlineAction, out var inlineActions);
+                    var speech = StripInlineActions(parsed.Speech, out _, out _);
+                    var parsedAction = string.IsNullOrWhiteSpace(parsed.Action) ||
+                                       parsed.Action.Equals("None", StringComparison.OrdinalIgnoreCase)
+                        ? inlineAction
+                        : parsed.Action;
+                    return parsed with { Text = text, Speech = speech, Action = parsedAction, InlineActions = inlineActions };
+                }
             }
             catch (JsonException)
             {
@@ -175,13 +385,57 @@ public sealed record AiReply(string Text, string Action, string Speech = "")
             }
         }
 
-        return new AiReply(raw.Trim(), "None");
+        var cleaned = StripInlineActions(raw, out var action, out var actions);
+        return new AiReply(cleaned, action) { InlineActions = actions };
+    }
+
+    private static string StripInlineActions(string? text, out string action, out string[] actions)
+    {
+        var input = text ?? string.Empty;
+        if (!InlineActionPattern.IsMatch(input))
+        {
+            action = "None";
+            actions = Array.Empty<string>();
+            return input.Trim();
+        }
+
+        var cleanLines = new List<string>();
+        var lineActions = new List<string>();
+        var pendingAction = "None";
+        foreach (var line in input.Replace("\r\n", "\n").Split('\n'))
+        {
+            var matches = InlineActionPattern.Matches(line);
+            var cleaned = InlineActionPattern.Replace(line, string.Empty).Trim();
+            var foundAction = matches.Count == 0 ? "None" : matches[0].Groups[1].Value;
+            if (cleaned.Length == 0)
+            {
+                if (matches.Count == 0)
+                    cleanLines.Add(string.Empty);
+                else if (lineActions.Count > 0 && lineActions[^1] == "None")
+                    lineActions[^1] = foundAction;
+                else
+                    pendingAction = foundAction;
+                continue;
+            }
+
+            cleanLines.Add(cleaned);
+            lineActions.Add(pendingAction == "None" ? foundAction : pendingAction);
+            pendingAction = "None";
+        }
+
+        action = lineActions.FirstOrDefault(candidate => candidate != "None") ?? "None";
+        actions = lineActions.ToArray();
+        return string.Join("\n", cleanLines).Trim();
     }
 
     public static void SelfTest()
     {
         var json = Parse("```json\n{\"text\":\"你好\",\"action\":\"Greet\",\"speech\":\"こんにちは\"}\n```");
-        if (json.Text != "你好" || json.Action != "Greet" || json.Speech != "こんにちは" || Parse("純文字").Action != "None")
+        var inline = Parse("hello\n\uFF08\u52D5\u4F5C\uFF1ATiltHead\uFF09\nworld\n(action: Stretch)");
+        if (json.Text != "你好" || json.Action != "Greet" || json.Speech != "こんにちは" || Parse("純文字").Action != "None" ||
+            inline.Action != "TiltHead" || inline.InlineActions.Length != 2 ||
+            inline.InlineActions[0] != "TiltHead" || inline.InlineActions[1] != "Stretch" ||
+            inline.Text.Contains("TiltHead") || inline.Text.Contains("Stretch"))
             throw new InvalidOperationException("AI reply parser self-test failed");
     }
 }
@@ -200,7 +454,8 @@ public static class AiClient
         string userText,
         int timeoutSeconds,
         CancellationToken lifetime,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        string requiredSpeechLanguage = "")
     {
         if (string.IsNullOrWhiteSpace(baseUrl))
             throw new InvalidOperationException("Base URL is empty");
@@ -208,16 +463,25 @@ public static class AiClient
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime);
         timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
-        for (var attempt = 0; attempt < 2; attempt++)
+        AiReply? replyNeedingSpeech = null;
+        for (var attempt = 0; attempt < 3; attempt++)
         {
+            var speechFallback = replyNeedingSpeech != null;
+            var prompt = speechFallback
+                ? $"Your previous response omitted speech. Translate the user's text into natural spoken {requiredSpeechLanguage}. Return only the translation, without JSON, labels, or explanation."
+                : systemPrompt;
+            var requestHistory = speechFallback ? Array.Empty<ChatMessage>() : history;
+            var requestText = speechFallback ? replyNeedingSpeech!.Text : userText;
             using var request = provider == ProviderKind.Anthropic
-                ? BuildAnthropicRequest(baseUrl, apiKey, model, systemPrompt, history, userText)
-                : BuildOpenAiRequest(provider, baseUrl, apiKey, model, systemPrompt, history, userText);
+                ? BuildAnthropicRequest(baseUrl, apiKey, model, prompt, requestHistory, requestText)
+                : BuildOpenAiRequest(provider, baseUrl, apiKey, model, prompt, requestHistory, requestText,
+                    speechFallback ? string.Empty : requiredSpeechLanguage);
             var requestBody = await request.Content!.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
-            log?.Invoke($"AI REQUEST\nProvider: {provider}\nModel: {model}\nEndpoint: {request.RequestUri}\nPayload:\n{requestBody}");
+            log?.Invoke($"AI REQUEST\nMode: {(speechFallback ? "Speech fallback" : "Reply")}\nProvider: {provider}\nModel: {model}\nEndpoint: {request.RequestUri}\nPayload:\n{requestBody}");
             using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
             var body = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
-            log?.Invoke($"AI RESPONSE\nStatus: {(int)response.StatusCode} {response.ReasonPhrase}\nBody:\n{body}");
+            var responseLog = speechFallback ? "AI SPEECH RESPONSE" : "AI RESPONSE";
+            log?.Invoke($"{responseLog}\nStatus: {(int)response.StatusCode} {response.ReasonPhrase}\nBody:\n{body}");
 
             if (!response.IsSuccessStatusCode)
                 throw new InvalidOperationException($"API {(int)response.StatusCode}: {Trim(body, 240)}");
@@ -228,6 +492,11 @@ public static class AiClient
                 : ReadOpenAiText(body, out finishReason);
             if (string.IsNullOrWhiteSpace(rawReply))
             {
+                if (speechFallback)
+                {
+                    log?.Invoke("AI SPEECH FALLBACK\nProvider returned no speech; text chat continues without TTS.");
+                    return replyNeedingSpeech!;
+                }
                 if (attempt == 0)
                 {
                     log?.Invoke($"AI RETRY\nProvider returned no answer content (finish_reason: {finishReason ?? "unknown"}); retrying once.");
@@ -238,8 +507,28 @@ public static class AiClient
                     : "API returned an empty response");
             }
 
+            if (speechFallback)
+            {
+                var translated = AiReply.Parse(rawReply);
+                var speech = string.IsNullOrWhiteSpace(translated.Speech) ? translated.Text : translated.Speech;
+                if (string.IsNullOrWhiteSpace(speech))
+                {
+                    log?.Invoke("AI SPEECH FALLBACK\nProvider returned no speech; text chat continues without TTS.");
+                    return replyNeedingSpeech!;
+                }
+                var result = replyNeedingSpeech! with { Speech = speech.Trim() };
+                log?.Invoke($"AI SPEECH PARSED\nSpeech: {result.Speech}");
+                return result;
+            }
+
             var reply = AiReply.Parse(rawReply);
-            log?.Invoke($"AI PARSED\nText: {reply.Text}\nSpeech: {reply.Speech}\nAction: {reply.Action}");
+            log?.Invoke($"AI PARSED\nText: {reply.Text}\nSpeech: {reply.Speech}\nAction: {reply.Action}\nClothing: {reply.Clothing}\nCommand: {reply.Command}\nArgument: {reply.Argument}\nMemory: {reply.Memory}");
+            if (!string.IsNullOrWhiteSpace(requiredSpeechLanguage) && string.IsNullOrWhiteSpace(reply.Speech))
+            {
+                replyNeedingSpeech = reply;
+                log?.Invoke($"AI SPEECH FALLBACK\nProvider omitted {requiredSpeechLanguage} speech; requesting translation only.");
+                continue;
+            }
             return reply;
         }
 
@@ -282,7 +571,8 @@ public static class AiClient
         string model,
         string systemPrompt,
         IReadOnlyList<ChatMessage> history,
-        string userText)
+        string userText,
+        string requiredSpeechLanguage)
     {
         if (model.StartsWith("nvidia/nemotron-nano-9b-v2", StringComparison.OrdinalIgnoreCase))
             systemPrompt = "/no_think\n" + systemPrompt;
@@ -299,6 +589,42 @@ public static class AiClient
         };
         if (provider == ProviderKind.OpenRouter)
             payload["reasoning"] = new { effort = "none", exclude = true };
+        if (provider == ProviderKind.OpenRouter &&
+            model.Equals("openrouter/free", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(requiredSpeechLanguage))
+        {
+            payload["response_format"] = new
+            {
+                type = "json_schema",
+                json_schema = new
+                {
+                    name = "lilith_reply",
+                    strict = true,
+                    schema = new
+                    {
+                        type = "object",
+                        properties = new
+                        {
+                            text = new { type = "string" },
+                            speech = new
+                            {
+                                type = "string",
+                                minLength = 1,
+                                description = $"The same meaning as text in natural spoken {requiredSpeechLanguage}",
+                            },
+                            action = new { type = "string" },
+                            clothing = new { type = "string" },
+                            command = new { type = "string" },
+                            argument = new { type = "string" },
+                            memory = new { type = "string" },
+                        },
+                        required = new[] { "text", "speech", "action", "clothing", "command", "argument", "memory" },
+                        additionalProperties = false,
+                    },
+                },
+            };
+            payload["provider"] = new { require_parameters = true };
+        }
 
         var request = JsonRequest(Endpoint(baseUrl, "chat/completions"), payload);
         if (!string.IsNullOrWhiteSpace(apiKey))

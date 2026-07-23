@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param([string]$GameDir)
+param(
+    [string]$GameDir,
+    [switch]$IncludeVoice
+)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -20,7 +23,7 @@ $japaneseRoot = Join-Path $GameDir 'BepInEx\data\LilithTextInjector\voice-runtim
 $irodoriRoot = Join-Path $japaneseRoot 'Irodori-TTS-Server'
 $uvPythonRoot = Join-Path $japaneseRoot '.uv-python'
 $hfCacheRoot = Join-Path $japaneseRoot '.hf-cache'
-foreach ($path in $coreArchive, $chineseArchive, $irodoriRoot, $uvPythonRoot, $hfCacheRoot) {
+foreach ($path in @($coreArchive) + $(if ($IncludeVoice) { $chineseArchive, $irodoriRoot, $uvPythonRoot, $hfCacheRoot })) {
     if (-not (Test-Path $path)) { throw "Required release source is missing: $path" }
 }
 
@@ -106,43 +109,13 @@ $baseFiles = @('.doorstop_version', 'doorstop_config.ini', 'winhttp.dll')
 Expand-SelectedArchive $coreArchive $baseRoot $basePrefixes $baseFiles
 Copy-PackageFiles $baseRoot
 
-$baseZip = Join-Path $output "LilithAI-v$version-base.zip"
+$textZip = Join-Path $output "LilithAI-v$version-text.zip"
 $chineseZip = Join-Path $output "LilithAI-v$version-voice-chinese.zip"
 $japaneseRuntime1Zip = Join-Path $output "LilithAI-v$version-voice-japanese-runtime-1.zip"
 $japaneseRuntime2Zip = Join-Path $output "LilithAI-v$version-voice-japanese-runtime-2.zip"
 $japaneseModelZip = Join-Path $output "LilithAI-v$version-voice-japanese-model.zip"
 
-Compress-Archive -Path (Join-Path $baseRoot '*') -DestinationPath $baseZip -CompressionLevel Optimal
-Copy-Item $chineseArchive $chineseZip
-
-$irodoriItems = @(Get-ZipItems $irodoriRoot 'BepInEx/data/LilithTextInjector/voice-runtime/Irodori-TTS-Server' {
-    param($relative)
-    -not $relative.StartsWith('.git/') -and
-    -not $relative.StartsWith('.venv/Lib/site-packages/torch/lib/')
-})
-$uvPythonItems = @(Get-ZipItems $uvPythonRoot 'BepInEx/data/LilithTextInjector/voice-runtime/.uv-python')
-$supportModelItems = @(Get-ZipItems $hfCacheRoot 'BepInEx/data/LilithTextInjector/voice-runtime/.hf-cache' {
-    param($relative)
-    -not $relative.StartsWith('hub/models--Aratako--Irodori-TTS-500M-v3/')
-})
-$torchLibRoot = Join-Path $irodoriRoot '.venv\Lib\site-packages\torch\lib'
-$torchItems = @(Get-ZipItems $torchLibRoot 'BepInEx/data/LilithTextInjector/voice-runtime/Irodori-TTS-Server/.venv/Lib/site-packages/torch/lib')
-$runtimeItems = @($irodoriItems + $uvPythonItems + $supportModelItems + $torchItems)
-$runtime1 = [Collections.Generic.List[object]]::new()
-$runtime2 = [Collections.Generic.List[object]]::new()
-$runtime1Size = 0L
-$runtime2Size = 0L
-foreach ($item in $runtimeItems | Sort-Object Length -Descending) {
-    if ($runtime1Size -le $runtime2Size) { $runtime1.Add($item); $runtime1Size += $item.Length }
-    else { $runtime2.Add($item); $runtime2Size += $item.Length }
-}
-New-Zip $japaneseRuntime1Zip $runtime1.ToArray()
-New-Zip $japaneseRuntime2Zip $runtime2.ToArray()
-
-$mainModelRoot = Join-Path $hfCacheRoot 'hub\models--Aratako--Irodori-TTS-500M-v3'
-$mainModelItems = @(Get-ZipItems $mainModelRoot 'BepInEx/data/LilithTextInjector/voice-runtime/.hf-cache/hub/models--Aratako--Irodori-TTS-500M-v3')
-New-Zip $japaneseModelZip $mainModelItems
-
+Compress-Archive -Path (Join-Path $baseRoot '*') -DestinationPath $textZip -CompressionLevel Optimal
 $required = @(
     'winhttp.dll',
     'BepInEx/core/BepInEx.Core.dll',
@@ -152,7 +125,7 @@ $required = @(
     'README.md', 'README.zh-CN.md', 'README.en.md', 'README.ja.md',
     'docs/images/hero.png', 'docs/images/chat.png', 'docs/images/settings.png'
 )
-$baseNames = Get-ZipNames $baseZip
+$baseNames = Get-ZipNames $textZip
 foreach ($name in $required) {
     if ($baseNames -notcontains $name) { throw "Base package is missing $name." }
 }
@@ -160,26 +133,58 @@ if ($baseNames -contains 'BepInEx/data/LilithTextInjector/voice-runtime/LilithVo
     throw 'Base package unexpectedly contains a voice runtime.'
 }
 
-$chineseNames = Get-ZipNames $chineseZip
-if ($chineseNames -notcontains 'BepInEx/data/LilithTextInjector/voice-runtime/LilithVoiceHost.exe') {
-    throw 'Chinese voice package is incomplete.'
-}
-$japaneseNames = @((Get-ZipNames $japaneseRuntime1Zip) + (Get-ZipNames $japaneseRuntime2Zip) +
-    (Get-ZipNames $japaneseModelZip))
-foreach ($name in @(
-    'BepInEx/data/LilithTextInjector/voice-runtime/Irodori-TTS-Server/src/irodori_openai_tts/__init__.py',
-    'BepInEx/data/LilithTextInjector/voice-runtime/Irodori-TTS-Server/.venv/Lib/site-packages/torch/lib/torch_cuda.dll'
-)) {
-    if ($japaneseNames -notcontains $name) { throw "Japanese voice packages are missing $name." }
-}
-if (-not ($japaneseNames | Where-Object { $_ -like 'BepInEx/data/LilithTextInjector/voice-runtime/.uv-python/*/python.exe' })) {
-    throw 'Japanese voice packages are missing bundled Python.'
-}
-if (-not ($japaneseNames | Where-Object { $_ -like 'BepInEx/data/LilithTextInjector/voice-runtime/.hf-cache/hub/models--Aratako--Irodori-TTS-500M-v3/snapshots/*/model.safetensors' })) {
-    throw 'Japanese voice packages are missing the Irodori model.'
-}
+$packages = @($textZip)
+if ($IncludeVoice) {
+    Copy-Item $chineseArchive $chineseZip
 
-$packages = @($baseZip, $chineseZip, $japaneseRuntime1Zip, $japaneseRuntime2Zip, $japaneseModelZip)
+    $irodoriItems = @(Get-ZipItems $irodoriRoot 'BepInEx/data/LilithTextInjector/voice-runtime/Irodori-TTS-Server' {
+        param($relative)
+        -not $relative.StartsWith('.git/') -and
+        -not $relative.StartsWith('.venv/Lib/site-packages/torch/lib/')
+    })
+    $uvPythonItems = @(Get-ZipItems $uvPythonRoot 'BepInEx/data/LilithTextInjector/voice-runtime/.uv-python')
+    $supportModelItems = @(Get-ZipItems $hfCacheRoot 'BepInEx/data/LilithTextInjector/voice-runtime/.hf-cache' {
+        param($relative)
+        -not $relative.StartsWith('hub/models--Aratako--Irodori-TTS-500M-v3/')
+    })
+    $torchLibRoot = Join-Path $irodoriRoot '.venv\Lib\site-packages\torch\lib'
+    $torchItems = @(Get-ZipItems $torchLibRoot 'BepInEx/data/LilithTextInjector/voice-runtime/Irodori-TTS-Server/.venv/Lib/site-packages/torch/lib')
+    $runtimeItems = @($irodoriItems + $uvPythonItems + $supportModelItems + $torchItems)
+    $runtime1 = [Collections.Generic.List[object]]::new()
+    $runtime2 = [Collections.Generic.List[object]]::new()
+    $runtime1Size = 0L
+    $runtime2Size = 0L
+    foreach ($item in $runtimeItems | Sort-Object Length -Descending) {
+        if ($runtime1Size -le $runtime2Size) { $runtime1.Add($item); $runtime1Size += $item.Length }
+        else { $runtime2.Add($item); $runtime2Size += $item.Length }
+    }
+    New-Zip $japaneseRuntime1Zip $runtime1.ToArray()
+    New-Zip $japaneseRuntime2Zip $runtime2.ToArray()
+
+    $mainModelRoot = Join-Path $hfCacheRoot 'hub\models--Aratako--Irodori-TTS-500M-v3'
+    $mainModelItems = @(Get-ZipItems $mainModelRoot 'BepInEx/data/LilithTextInjector/voice-runtime/.hf-cache/hub/models--Aratako--Irodori-TTS-500M-v3')
+    New-Zip $japaneseModelZip $mainModelItems
+
+    $chineseNames = Get-ZipNames $chineseZip
+    if ($chineseNames -notcontains 'BepInEx/data/LilithTextInjector/voice-runtime/LilithVoiceHost.exe') {
+        throw 'Chinese voice package is incomplete.'
+    }
+    $japaneseNames = @((Get-ZipNames $japaneseRuntime1Zip) + (Get-ZipNames $japaneseRuntime2Zip) +
+        (Get-ZipNames $japaneseModelZip))
+    foreach ($name in @(
+        'BepInEx/data/LilithTextInjector/voice-runtime/Irodori-TTS-Server/src/irodori_openai_tts/__init__.py',
+        'BepInEx/data/LilithTextInjector/voice-runtime/Irodori-TTS-Server/.venv/Lib/site-packages/torch/lib/torch_cuda.dll'
+    )) {
+        if ($japaneseNames -notcontains $name) { throw "Japanese voice packages are missing $name." }
+    }
+    if (-not ($japaneseNames | Where-Object { $_ -like 'BepInEx/data/LilithTextInjector/voice-runtime/.uv-python/*/python.exe' })) {
+        throw 'Japanese voice packages are missing bundled Python.'
+    }
+    if (-not ($japaneseNames | Where-Object { $_ -like 'BepInEx/data/LilithTextInjector/voice-runtime/.hf-cache/hub/models--Aratako--Irodori-TTS-500M-v3/snapshots/*/model.safetensors' })) {
+        throw 'Japanese voice packages are missing the Irodori model.'
+    }
+    $packages += $chineseZip, $japaneseRuntime1Zip, $japaneseRuntime2Zip, $japaneseModelZip
+}
 foreach ($package in $packages) {
     if ((Get-Item $package).Length -gt 2GB) { throw "$package exceeds the GitHub 2 GiB asset limit." }
 }

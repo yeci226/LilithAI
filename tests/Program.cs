@@ -63,6 +63,20 @@ if (TtsClient.VoicePlaybackDelayFrames != 2 ||
     TtsClient.GetVoiceServiceStatus(VoiceMode.Japanese, true, true, true, true, true, false) != VoiceServiceStatus.Ready ||
     TtsClient.GetVoiceServiceStatus(VoiceMode.Chinese, true, true, false, false, false, false) != VoiceServiceStatus.ManualStart)
     throw new InvalidOperationException("TTS playback and warm-host policy self-test failed");
+var disabledStages = new HashSet<string>();
+var stageLogs = new List<string>();
+var brokenStageRuns = 0;
+var laterStageRan = false;
+if (RuntimeStage.TryRunOptional("broken", () =>
+    {
+        brokenStageRuns++;
+        throw new InvalidOperationException("expected smoke failure");
+    }, disabledStages, stageLogs.Add) ||
+    RuntimeStage.TryRunOptional("broken", () => brokenStageRuns++, disabledStages, stageLogs.Add) ||
+    !RuntimeStage.TryRunOptional("later", () => laterStageRan = true, disabledStages, stageLogs.Add) ||
+    brokenStageRuns != 1 || !laterStageRan || stageLogs.Count != 1 ||
+    !stageLogs[0].Contains("broken") || !stageLogs[0].Contains("other stages continue"))
+    throw new InvalidOperationException("Optional runtime stage isolation self-test failed");
 var translatedReply = new AiReply("English display", "None", "Chinese speech");
 var splitReply = TtsClient.SplitForSpeech(new AiReply("第一段\n\n第二段", "Greet", "一段目\n\n二段目"));
 var inlineReply = AiReply.Parse("first\n\uFF08\u52D5\u4F5C\uFF1ATiltHead\uFF09\nsecond\n(action: Stretch)");

@@ -21,6 +21,31 @@ public enum VoiceServiceStatus
     Failed,
 }
 
+public static class RuntimeStage
+{
+    public static bool TryRunOptional(
+        string name,
+        Action action,
+        ISet<string> disabledStages,
+        Action<string> log)
+    {
+        if (disabledStages.Contains(name))
+            return false;
+
+        try
+        {
+            action();
+            return true;
+        }
+        catch (Exception exception)
+        {
+            if (disabledStages.Add(name))
+                log($"Optional runtime stage '{name}' disabled after failure; other stages continue: {exception}");
+            return false;
+        }
+    }
+}
+
 public static class UiMath
 {
     public static int MouseWheelDelta(long wParam) => unchecked((short)(wParam >> 16));

@@ -9,7 +9,8 @@ using System.Runtime.InteropServices;
 using System.Text;
 using TMPro;
 using UI.Common;
-using UI.TraySetting;
+using UI.TraySettingNew;
+using UI.TraySettingNew.SettingItems;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.Events;
@@ -166,6 +167,8 @@ public sealed class Controller : MonoBehaviour
 
     private readonly List<ChatMessage> _history = new();
     private readonly List<LongTermMemory> _longTermMemory = new();
+    // ponytail: disabled stages stay off for this controller lifetime; retry only with a version-aware recovery policy.
+    private readonly HashSet<string> _disabledOptionalStages = new(StringComparer.Ordinal);
     private ModSettings _settings = null!;
     private CancellationTokenSource? _lifetime;
     private Task<AiReply>? _request;
@@ -184,7 +187,8 @@ public sealed class Controller : MonoBehaviour
     private VoiceMode _voiceMode;
     private bool _usesDefaultPrompt;
     private string _lastGameLanguage = string.Empty;
-    private TraySettingView? _settingsView;
+    private TraySettingNewView? _settingsView;
+    private GameObject? _trayCustomRoot;
     private RectTransform? _trayContent;
     private RectTransform? _trayViewport;
     private float _trayContentTop;
@@ -211,7 +215,7 @@ public sealed class Controller : MonoBehaviour
     private TMP_InputField? _chatInput;
     private Button? _chatSendButton;
     private Button? _chatCancelButton;
-    private Il2CppSystem.Action? _headerAction;
+    private UnityAction? _headerAction;
     private Il2CppSystem.Action? _doubleClickAction;
     private UnityAction? _previousProviderAction;
     private UnityAction? _nextProviderAction;
@@ -230,7 +234,7 @@ public sealed class Controller : MonoBehaviour
     private Task<string[]>? _modelListRequest;
     private bool _modelListFailed;
     private int _lastSettingsScanFrame;
-    private int _lastTrayTab = -1;
+    private TraySettingTab? _lastTrayTab;
     private int _menuInjectionFrame = -1;
     private int _menuInjectionDeadline = -1;
     private bool _trayWasVisible;
@@ -288,24 +292,28 @@ public sealed class Controller : MonoBehaviour
         UpdateSpeechPlayback();
         UpdateThinking();
         ShowPendingReply();
-        RefreshDefaultPromptLanguage();
-        UpdateChatMenuButton();
-        EnsureGameDialogueMemory();
-        SelectAiTabWhenOpened();
-        RefreshProviderRowsWhenTabChanges();
-        EnsureTrayWheelHook();
-        HandleTrayWheel(Interlocked.Exchange(ref _trayWheelDelta, 0) / 120f);
+        RunOptionalStage(nameof(RefreshDefaultPromptLanguage), RefreshDefaultPromptLanguage);
+        RunOptionalStage(nameof(UpdateChatMenuButton), UpdateChatMenuButton);
+        RunOptionalStage(nameof(EnsureGameDialogueMemory), EnsureGameDialogueMemory);
+        RunOptionalStage(nameof(SelectAiTabWhenOpened), SelectAiTabWhenOpened);
+        RunOptionalStage(nameof(RefreshProviderRowsWhenTabChanges), RefreshProviderRowsWhenTabChanges);
+        RunOptionalStage(nameof(EnsureTrayWheelHook), EnsureTrayWheelHook);
+        RunOptionalStage(nameof(HandleTrayWheel), () => HandleTrayWheel(Interlocked.Exchange(ref _trayWheelDelta, 0) / 120f));
 
         if (Time.frameCount - _lastSettingsScanFrame > 120)
         {
             _lastSettingsScanFrame = Time.frameCount;
-            EnsureTraySettings();
-            EnsureChatIntegration();
-            EnsureLocalVoiceHost();
-            RefreshVoiceLabel();
+            RunOptionalStage(nameof(EnsureTraySettings), EnsureTraySettings);
+            RunOptionalStage(nameof(EnsureChatIntegration), EnsureChatIntegration);
+            RunOptionalStage(nameof(EnsureLocalVoiceHost), EnsureLocalVoiceHost);
+            RunOptionalStage(nameof(RefreshVoiceLabel), RefreshVoiceLabel);
         }
 
     }
+
+    [HideFromIl2Cpp]
+    private void RunOptionalStage(string name, Action action) =>
+        RuntimeStage.TryRunOptional(name, action, _disabledOptionalStages, message => Plugin.LogSource.LogWarning(message));
 
     private void OnDestroy()
     {
@@ -1346,19 +1354,53 @@ public sealed class Controller : MonoBehaviour
     [HideFromIl2Cpp]
     private void EnsureTraySettings()
     {
-        var view = UnityEngine.Object.FindObjectOfType<TraySettingView>();
-        if (view == null || view == _settingsView || view._viewNotesLabel == null || view._musicDirInputField == null ||
-            view._gameLanguageButton == null || view._adjustFantasyScheduleSlider == null)
+        var view = UnityEngine.Object.FindObjectOfType<TraySettingNewView>();
+        if (view == null)
             return;
+
+        if (_settingsView != null && _settingsView != view)
+        {
+            if (_trayCustomRoot != null)
+                UnityEngine.Object.Destroy(_trayCustomRoot);
+            _trayCustomRoot = null;
+            _trayHeaderLabel = null;
+            _trayProviderValue = null;
+            _trayBaseUrlInput = null;
+            _trayModelValue = null;
+            _trayVoiceValue = null;
+            _trayApiKeyInput = null;
+            _trayPromptInput = null;
+        }
+
+        _settingsView = view;
+        if (view._currentTab != TraySettingTab.Lilith)
+        {
+            _trayCustomRoot?.SetActive(false);
+            return;
+        }
+
+        if (_trayCustomRoot != null && _trayHeaderLabel != null && _trayProviderValue != null &&
+            _trayBaseUrlInput != null && _trayModelValue != null && _trayVoiceValue != null &&
+            _trayApiKeyInput != null && _trayPromptInput != null)
+        {
+            _trayCustomRoot.SetActive(true);
+            return;
+        }
 
         try
         {
-            var actionRow = view.GetRowOf(view._viewNotesLabel.transform);
-            var inputRow = view.GetRowOf(view._musicDirInputField.transform);
-            var selectorRow = view.GetRowOf(view._gameLanguageButton.transform);
-            var fantasyRow = view.GetRowOf(view._adjustFantasyScheduleSlider.transform);
+            var settingRoot = view._settingItemRoot;
+            if (settingRoot == null || !view._tabsBuilt)
+                return;
+            var rowsContainer = settingRoot.GetComponent<RectTransform>();
+            if (rowsContainer == null || rowsContainer.parent == null)
+                return;
+            var inputTemplate = FindNativeSettingTemplate<SettingInputFieldItem>(view);
+            var buttonTemplate = FindNativeSettingTemplate<SettingBigButtonItem>(view);
+            if (inputTemplate == null || buttonTemplate == null)
+                throw new InvalidOperationException("TraySettingNew has no reusable input/button setting item");
 
-            _headerAction = DelegateSupport.ConvertDelegate<Il2CppSystem.Action>(new System.Action(NoOp));
+            _headerAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NoOp));
             _previousProviderAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(PreviousProvider));
             _nextProviderAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NextProvider));
             _previousModelAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(PreviousModel));
@@ -1369,80 +1411,83 @@ public sealed class Controller : MonoBehaviour
             _endKeyboardInputAction = DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(EndKeyboardInput));
             _saveTrayInputAction = DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(SaveTrayInput));
 
-            _trayHeaderLabel = view.CloneActionRow(actionRow, "LilithAIHeaderRow", _headerAction);
+            _trayCustomRoot = new GameObject("LilithAISettings");
+            var customRoot = _trayCustomRoot.GetComponent<RectTransform>() ??
+                             _trayCustomRoot.AddComponent<RectTransform>();
+            if (customRoot == null || _trayCustomRoot.GetComponent<RectTransform>() != customRoot)
+                throw new InvalidOperationException("LilithAI settings root has no RectTransform");
+            customRoot.SetParent(settingRoot, false);
+            customRoot.anchorMin = new Vector2(0f, 1f);
+            customRoot.anchorMax = new Vector2(1f, 1f);
+            customRoot.pivot = new Vector2(0.5f, 1f);
+            customRoot.anchoredPosition = Vector2.zero;
+            customRoot.sizeDelta = Vector2.zero;
+            var group = _trayCustomRoot.AddComponent<VerticalLayoutGroup>();
+            group.childControlWidth = true;
+            group.childControlHeight = true;
+            group.childForceExpandWidth = true;
+            group.childForceExpandHeight = false;
+            group.spacing = 4f;
+            var fitter = _trayCustomRoot.AddComponent<ContentSizeFitter>();
+            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            var header = CloneButton(buttonTemplate, customRoot, "LilithAIHeaderRow",
+                T("AI 莉莉絲聊天設定", "AI 莉莉丝聊天设置", "AI リリス チャット設定", "Lilith AI Chat Settings"), _headerAction!, false);
+            _trayHeaderLabel = header._buttonText;
             SetLabel(_trayHeaderLabel, T("AI 莉莉絲聊天設定", "AI 莉莉丝聊天设置", "AI リリス チャット設定", "Lilith AI Chat Settings"));
             _trayHeaderLabel.fontStyle |= FontStyles.Bold;
             _trayHeaderLabel.enableWordWrapping = false;
             _trayHeaderLabel.alignment = TextAlignmentOptions.Center;
-            var headerRow = view.GetRowOf(_trayHeaderLabel.transform);
-            var headerRect = _trayHeaderLabel.GetComponent<RectTransform>();
-            var headerButton = headerRow.GetComponentInChildren<Button>(true);
-            if (headerButton != null)
-                headerButton.interactable = false;
-            headerRect.SetParent(headerRow, false);
-            headerRect.anchorMin = Vector2.zero;
-            headerRect.anchorMax = Vector2.one;
-            headerRect.pivot = new Vector2(0.5f, 0.5f);
-            headerRect.offsetMin = new Vector2(20f, 0f);
-            headerRect.offsetMax = new Vector2(-20f, 0f);
 
-            _trayProviderValue = CloneSelectorRow(view, selectorRow, "LilithAIProviderRow", T("供應商", "提供商", "プロバイダー", "Provider"), _previousProviderAction!, _nextProviderAction!);
-            SetLabel(_trayProviderValue, _provider.ToString());
-
-            _trayBaseUrlInput = CloneInput(view, inputRow, "LilithAIBaseUrlRow", T("API 位址", "API 地址", "API URL", "API URL"), _baseUrl);
-            _trayModelValue = CloneSelectorRow(view, selectorRow, "LilithAIModelRow", T("模型", "模型", "モデル", "Model"), _previousModelAction!, _nextModelAction!);
-            SetLabel(_trayModelValue, _model);
-            _trayVoiceValue = CloneSelectorRow(view, selectorRow, "LilithAIVoiceRow", T("語音", "语音", "音声", "Voice"), _previousVoiceAction!, _nextVoiceAction!);
+            var provider = CloneButton(buttonTemplate, customRoot, "LilithAIProviderRow", _provider.ToString(), _nextProviderAction!, true);
+            _trayProviderValue = provider._buttonText;
+            var model = CloneButton(buttonTemplate, customRoot, "LilithAIModelRow", _model, _nextModelAction!, true);
+            _trayModelValue = model._buttonText;
+            var voice = CloneButton(buttonTemplate, customRoot, "LilithAIVoiceRow", VoiceModeLabel(), _nextVoiceAction!, true);
+            _trayVoiceValue = voice._buttonText;
             _trayVoiceValue.enableAutoSizing = true;
             _trayVoiceValue.fontSizeMin = 10f;
-            SetLabel(_trayVoiceValue, VoiceModeLabel());
-            _trayApiKeyInput = CloneInput(view, inputRow, "LilithAIApiKeyRow", "API Key", _apiKey);
+
+            _trayBaseUrlInput = CloneInput(inputTemplate, customRoot, "LilithAIBaseUrlRow",
+                T("API 位址", "API 地址", "API URL", "API URL"), _baseUrl);
+            _trayApiKeyInput = CloneInput(inputTemplate, customRoot, "LilithAIApiKeyRow", "API Key", _apiKey);
             _trayApiKeyInput.contentType = TMP_InputField.ContentType.Password;
             _trayApiKeyInput.ForceLabelUpdate();
-            _trayPromptInput = CloneInput(view, inputRow, "LilithAIPromptRow", T("莉莉絲角色設定", "莉莉丝角色设定", "リリスのキャラクター設定", "Lilith Character Prompt"),
+            _trayPromptInput = CloneInput(inputTemplate, customRoot, "LilithAIPromptRow",
+                T("莉莉絲角色設定", "莉莉丝角色设定", "リリスのキャラクター設定", "Lilith Character Prompt"),
                 _usesDefaultPrompt ? ProviderProfiles.CharacterPrompt(GameSetting.Language) : _prompt);
             _trayPromptInput.lineType = TMP_InputField.LineType.MultiLineNewline;
             _trayPromptInput.scrollSensitivity = 30f;
-            _trayPromptInput.textComponent.enableWordWrapping = true;
-            SetInputRowHeight(view, _trayPromptInput, 150f, 110f);
-
-            foreach (var control in new Component[]
-                     {
-                         _trayHeaderLabel,
-                         _trayProviderValue, _trayBaseUrlInput, _trayModelValue, _trayVoiceValue, _trayApiKeyInput,
-                         _trayPromptInput,
-                     })
-            {
-                view.GetRowOf(control.transform).gameObject.SetActive(true);
-                view.MapRow(control, TraySettingView.TabLilith);
-            }
-
-            var insertIndex = fantasyRow.GetSiblingIndex() + 1;
-            foreach (var control in new Component[]
-                     {
-                         _trayHeaderLabel, _trayProviderValue, _trayBaseUrlInput, _trayModelValue,
-                         _trayVoiceValue, _trayApiKeyInput, _trayPromptInput,
-                     })
-                view.GetRowOf(control.transform).SetSiblingIndex(insertIndex++);
+            if (_trayPromptInput.textComponent != null)
+                _trayPromptInput.textComponent.enableWordWrapping = true;
+            SetInputRowHeight(_trayPromptInput, 150f, 110f);
 
             Canvas.ForceUpdateCanvases();
-            var rowsContainer = actionRow.parent.GetComponent<RectTransform>();
             EnsureWheelScrolling(rowsContainer);
-            view.SelectTab(TraySettingView.TabLilith);
-            _settingsView = view;
             ResetModelsForProvider();
+            RefreshLocalizedUi();
             RefreshProviderRows();
             LayoutRebuilder.ForceRebuildLayoutImmediate(rowsContainer);
             _trayContentTop = rowsContainer.anchoredPosition.y;
             _trayScrollOffset = 0f;
             _trayScrollReady = true;
             ApplyTrayScroll();
-            Plugin.LogSource.LogInfo("Added Lilith AI controls to TraySettingView");
+            Plugin.LogSource.LogInfo("Added Lilith AI controls to TraySettingNewView");
         }
-        catch (Exception exception)
+        catch
         {
-            Plugin.LogSource.LogWarning($"Tray settings controls unavailable: {exception.Message}");
-            _settingsView = view;
+            if (_trayCustomRoot != null)
+                UnityEngine.Object.Destroy(_trayCustomRoot);
+            _trayCustomRoot = null;
+            _trayHeaderLabel = null;
+            _trayProviderValue = null;
+            _trayBaseUrlInput = null;
+            _trayModelValue = null;
+            _trayVoiceValue = null;
+            _trayApiKeyInput = null;
+            _trayPromptInput = null;
+            throw;
         }
     }
 
@@ -1607,7 +1652,6 @@ public sealed class Controller : MonoBehaviour
             SetLabel(title, T("對莉莉絲說", "和莉莉丝说话", "リリスに話しかける", "Talk to Lilith"));
         if (_chatInput.placeholder is TMP_Text placeholder)
         {
-            TraySettingView.StripLabelLocalizer(placeholder);
             placeholder.text = T("輸入訊息…", "输入消息…", "メッセージを入力…", "Type a message…");
         }
 
@@ -1678,14 +1722,33 @@ public sealed class Controller : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
-    private TMP_InputField CloneInput(TraySettingView view, Transform sourceRow, string rowName, string labelText, string value)
+    private static T? FindNativeSettingTemplate<T>(TraySettingNewView view) where T : Component
     {
-        var input = view.CloneInputRow(sourceRow, rowName, out var label);
-        SetLabel(label, labelText);
+        var items = UnityEngine.Resources.FindObjectsOfTypeAll<T>();
+        return items.FirstOrDefault(item => !item.gameObject.scene.IsValid()) ??
+               items.FirstOrDefault(item => item.transform.IsChildOf(view.transform));
+    }
+
+    [HideFromIl2Cpp]
+    private TMP_InputField CloneInput(SettingInputFieldItem template, Transform parent, string rowName, string labelText, string value)
+    {
+        var row = UnityEngine.Object.Instantiate(template.gameObject, parent);
+        row.name = rowName;
+        row.SetActive(true);
+        var item = row.GetComponent<SettingInputFieldItem>() ??
+                   throw new InvalidOperationException("TraySettingNew input item has no component");
+        var input = item._inputField ??
+                    throw new InvalidOperationException("TraySettingNew input item has no input field");
+        if (item._nameText != null)
+            SetLabel(item._nameText, labelText);
+        item._currentValue = value;
         input.onValueChanged.RemoveAllListeners();
         input.onEndEdit.RemoveAllListeners();
         input.onSelect.RemoveAllListeners();
         input.onDeselect.RemoveAllListeners();
+        input.onSubmit.RemoveAllListeners();
+        item._editButton?.onClick.RemoveAllListeners();
+        item.OnValueChanged = null;
         input.onSelect.AddListener(_focusGameWindowAction!);
         input.onDeselect.AddListener(_endKeyboardInputAction!);
         input.onEndEdit.AddListener(_saveTrayInputAction!);
@@ -1709,41 +1772,39 @@ public sealed class Controller : MonoBehaviour
     private void SaveTrayInput(string _) => SyncTraySettings();
 
     [HideFromIl2Cpp]
-    private static TMP_Text CloneSelectorRow(
-        TraySettingView view,
-        Transform sourceRow,
+    private static SettingBigButtonItem CloneButton(
+        SettingBigButtonItem template,
+        Transform parent,
         string rowName,
-        string labelText,
-        UnityAction previous,
-        UnityAction next)
+        string text,
+        UnityAction action,
+        bool interactable)
     {
-        var row = UnityEngine.Object.Instantiate(sourceRow, sourceRow.parent);
+        var row = UnityEngine.Object.Instantiate(template.gameObject, parent);
         row.name = rowName;
-        row.gameObject.SetActive(true);
-
-        var label = row.Find("Text (TMP)").GetComponent<TMP_Text>();
-        var selector = row.Find("gameLanguageButton");
-        var value = selector.Find("Text (TMP)").GetComponent<TMP_Text>();
-        var previousButton = selector.Find("Prev").GetComponent<Button>();
-        var nextButton = selector.Find("Next").GetComponent<Button>();
-        var originalControl = selector.GetComponent<TraySettingGameLanguageButton>();
-        if (originalControl != null)
-            originalControl.enabled = false;
-
-        previousButton.onClick.RemoveAllListeners();
-        previousButton.onClick.AddListener(previous);
-        nextButton.onClick.RemoveAllListeners();
-        nextButton.onClick.AddListener(next);
-        SetLabel(label, labelText);
-        TraySettingView.StripLabelLocalizer(value);
-        return value;
+        row.SetActive(true);
+        var item = row.GetComponent<SettingBigButtonItem>() ??
+                   throw new InvalidOperationException("TraySettingNew button item has no component");
+        var button = item._button ??
+                     throw new InvalidOperationException("TraySettingNew button item has no button");
+        var label = item._buttonText ??
+                    throw new InvalidOperationException("TraySettingNew button item has no text");
+        button.onClick.RemoveAllListeners();
+        item.OnValueChanged = null;
+        button.onClick.AddListener(action);
+        button.interactable = interactable;
+        SetLabel(label, text);
+        return item;
     }
 
     [HideFromIl2Cpp]
-    private static void SetInputRowHeight(TraySettingView view, TMP_InputField input, float rowHeight, float inputHeight)
+    private static void SetInputRowHeight(TMP_InputField input, float rowHeight, float inputHeight)
     {
-        var row = view.GetRowOf(input.transform);
-        var rowRect = row.GetComponent<RectTransform>();
+        var item = input.GetComponentInParent<SettingInputFieldItem>() ??
+                   throw new InvalidOperationException("TraySettingNew input field has no owning item");
+        var row = item.transform;
+        var rowRect = row.GetComponent<RectTransform>() ??
+                      throw new InvalidOperationException("TraySettingNew input item has no rect transform");
         rowRect.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, rowHeight);
         var layout = row.GetComponent<LayoutElement>() ?? row.gameObject.AddComponent<LayoutElement>();
         layout.minHeight = rowHeight;
@@ -1763,11 +1824,14 @@ public sealed class Controller : MonoBehaviour
             if (input.textViewport.GetComponent<RectMask2D>() == null)
                 input.textViewport.gameObject.AddComponent<RectMask2D>();
         }
-        var labelRect = row.Find("Text (TMP)").GetComponent<RectTransform>();
-        labelRect.anchorMin = new Vector2(labelRect.anchorMin.x, 0.5f);
-        labelRect.anchorMax = new Vector2(labelRect.anchorMax.x, 0.5f);
-        labelRect.pivot = new Vector2(labelRect.pivot.x, 0.5f);
-        labelRect.anchoredPosition = new Vector2(labelRect.anchoredPosition.x, 0f);
+        var labelRect = item?._nameText?.GetComponent<RectTransform>();
+        if (labelRect != null)
+        {
+            labelRect.anchorMin = new Vector2(labelRect.anchorMin.x, 0.5f);
+            labelRect.anchorMax = new Vector2(labelRect.anchorMax.x, 0.5f);
+            labelRect.pivot = new Vector2(labelRect.pivot.x, 0.5f);
+            labelRect.anchoredPosition = new Vector2(labelRect.anchoredPosition.x, 0f);
+        }
     }
 
     [HideFromIl2Cpp]
@@ -1787,7 +1851,6 @@ public sealed class Controller : MonoBehaviour
     [HideFromIl2Cpp]
     private static void SetLabel(TMP_Text label, string text)
     {
-        TraySettingView.StripLabelLocalizer(label);
         label.text = text;
     }
 
@@ -1808,7 +1871,7 @@ public sealed class Controller : MonoBehaviour
         _model = ProviderProfiles.DefaultModel(_provider);
         _trayBaseUrlInput?.SetTextWithoutNotify(_baseUrl);
         if (_trayProviderValue != null)
-            SetLabel(_trayProviderValue, _provider.ToString());
+            SetTrayValue(_trayProviderValue, _provider.ToString());
         ResetModelsForProvider();
         RefreshProviderRows();
         SaveTraySettings();
@@ -1838,7 +1901,7 @@ public sealed class Controller : MonoBehaviour
         _speechRequest = null;
         StopLocalVoiceHosts();
         if (_trayVoiceValue != null)
-            SetLabel(_trayVoiceValue, VoiceModeLabel());
+            SetTrayValue(_trayVoiceValue, VoiceModeLabel());
         SaveTraySettings();
         EnsureLocalVoiceHost();
         RefreshVoiceLabel();
@@ -1860,7 +1923,7 @@ public sealed class Controller : MonoBehaviour
     private void RefreshVoiceLabel()
     {
         if (_trayVoiceValue != null)
-            SetLabel(_trayVoiceValue, VoiceModeLabel());
+            SetTrayValue(_trayVoiceValue, VoiceModeLabel());
     }
 
     private string VoiceStatusLabel()
@@ -1908,7 +1971,7 @@ public sealed class Controller : MonoBehaviour
         var current = Math.Max(0, _availableModels.IndexOf(_model));
         _model = _availableModels[(current + direction + _availableModels.Count) % _availableModels.Count];
         if (_trayModelValue != null)
-            SetLabel(_trayModelValue, _model);
+            SetTrayValue(_trayModelValue, _model);
         SaveTraySettings();
     }
 
@@ -1922,7 +1985,7 @@ public sealed class Controller : MonoBehaviour
         if (_availableModels.Count > 0 && !_availableModels.Contains(_model))
             _model = _availableModels[0];
         if (_trayModelValue != null)
-            SetLabel(_trayModelValue, string.IsNullOrWhiteSpace(_model)
+            SetTrayValue(_trayModelValue, string.IsNullOrWhiteSpace(_model)
                 ? T("按箭頭讀取", "按箭头读取", "矢印で読み込む", "Use arrows to load")
                 : _model);
     }
@@ -1938,7 +2001,7 @@ public sealed class Controller : MonoBehaviour
         _modelListFailed = false;
         _modelListRequest = AiClient.ListModelsAsync(_baseUrl, _apiKey, _settings.TimeoutSeconds, _lifetime!.Token);
         if (_trayModelValue != null)
-            SetLabel(_trayModelValue, T("讀取模型…", "读取模型…", "モデルを読み込み中…", "Loading models…"));
+            SetTrayValue(_trayModelValue, T("讀取模型…", "读取模型…", "モデルを読み込み中…", "Loading models…"));
     }
 
     [HideFromIl2Cpp]
@@ -1958,14 +2021,14 @@ public sealed class Controller : MonoBehaviour
             if (!_availableModels.Contains(_model))
                 _model = _availableModels[0];
             if (_trayModelValue != null)
-                SetLabel(_trayModelValue, _model);
+                SetTrayValue(_trayModelValue, _model);
             SaveTraySettings();
         }
         catch (Exception exception)
         {
             _modelListFailed = true;
             if (_trayModelValue != null)
-                SetLabel(_trayModelValue, T("模型讀取失敗", "模型读取失败", "モデルの読み込みに失敗", "Failed to load models"));
+                SetTrayValue(_trayModelValue, T("模型讀取失敗", "模型读取失败", "モデルの読み込みに失敗", "Failed to load models"));
             Plugin.LogSource.LogWarning(exception.Message);
         }
         finally
@@ -1994,7 +2057,13 @@ public sealed class Controller : MonoBehaviour
         if (_settingsView == null || control == null)
             return;
 
-        var row = _settingsView.GetRowOf(control.transform);
+        if (_trayCustomRoot == null)
+            return;
+
+        var row = control.transform;
+        var customRoot = _trayCustomRoot.transform;
+        while (row.parent != null && row.parent != customRoot)
+            row = row.parent;
         row.gameObject.SetActive(visible);
     }
 
@@ -2005,8 +2074,12 @@ public sealed class Controller : MonoBehaviour
             return;
 
         _lastTrayTab = _settingsView._currentTab;
-        if (_lastTrayTab == TraySettingView.TabLilith)
+        _trayCustomRoot?.SetActive(_lastTrayTab == TraySettingTab.Lilith);
+        if (_lastTrayTab == TraySettingTab.Lilith)
+        {
+            RunOptionalStage(nameof(EnsureTraySettings), EnsureTraySettings);
             RefreshProviderRows();
+        }
     }
 
     [HideFromIl2Cpp]
@@ -2153,14 +2226,14 @@ public sealed class Controller : MonoBehaviour
         SetTrayLabel(_trayApiKeyInput, "API Key");
         SetTrayLabel(_trayPromptInput, T("莉莉絲角色設定", "莉莉丝角色设定", "リリスのキャラクター設定", "Lilith Character Prompt"));
         if (_trayVoiceValue != null)
-            SetLabel(_trayVoiceValue, VoiceModeLabel());
+            SetTrayValue(_trayVoiceValue, VoiceModeLabel());
 
         if (_trayModelValue != null && _modelListRequest != null)
-            SetLabel(_trayModelValue, T("讀取模型…", "读取模型…", "モデルを読み込み中…", "Loading models…"));
+            SetTrayValue(_trayModelValue, T("讀取模型…", "读取模型…", "モデルを読み込み中…", "Loading models…"));
         else if (_trayModelValue != null && _modelListFailed)
-            SetLabel(_trayModelValue, T("模型讀取失敗", "模型读取失败", "モデルの読み込みに失敗", "Failed to load models"));
+            SetTrayValue(_trayModelValue, T("模型讀取失敗", "模型读取失败", "モデルの読み込みに失敗", "Failed to load models"));
         else if (_trayModelValue != null && string.IsNullOrWhiteSpace(_model))
-            SetLabel(_trayModelValue, T("按箭頭讀取", "按箭头读取", "矢印で読み込む", "Use arrows to load"));
+            SetTrayValue(_trayModelValue, T("按箭頭讀取", "按箭头读取", "矢印で読み込む", "Use arrows to load"));
 
         if (_chatRoot != null)
         {
@@ -2178,11 +2251,31 @@ public sealed class Controller : MonoBehaviour
     [HideFromIl2Cpp]
     private void SetTrayLabel(Component? control, string text)
     {
-        if (_settingsView == null || control == null)
+        if (control == null)
             return;
-        var label = _settingsView.GetRowOf(control.transform).Find("Text (TMP)")?.GetComponent<TMP_Text>();
-        if (label != null)
-            SetLabel(label, text);
+
+        if (control == _trayProviderValue || control == _trayModelValue || control == _trayVoiceValue)
+        {
+            var value = control == _trayProviderValue ? _provider.ToString() :
+                control == _trayVoiceValue ? VoiceModeLabel() : _model;
+            SetTrayValue(control, value);
+            return;
+        }
+
+        var item = control.GetComponentInParent<SettingInputFieldItem>();
+        if (item?._nameText != null)
+            SetLabel(item._nameText, text);
+    }
+
+    [HideFromIl2Cpp]
+    private void SetTrayValue(Component? control, string value)
+    {
+        if (control is not TMP_Text label)
+            return;
+        var prefix = control == _trayProviderValue ? T("供應商", "提供商", "プロバイダー", "Provider") :
+            control == _trayModelValue ? T("模型", "模型", "モデル", "Model") :
+            control == _trayVoiceValue ? T("語音", "语音", "音声", "Voice") : string.Empty;
+        SetLabel(label, string.IsNullOrWhiteSpace(prefix) ? value : $"{prefix}: {value}");
     }
 
     [HideFromIl2Cpp]
@@ -2205,7 +2298,9 @@ public sealed class Controller : MonoBehaviour
         var visible = _settingsView.IsVisible;
         if (visible && !_trayWasVisible)
         {
-            _settingsView.SelectTab(TraySettingView.TabLilith);
+            _settingsView.SelectTab(TraySettingTab.Lilith);
+            RunOptionalStage(nameof(EnsureTraySettings), EnsureTraySettings);
+            _trayCustomRoot?.SetActive(true);
             RefreshProviderRows();
             ScrollTrayToTop();
         }

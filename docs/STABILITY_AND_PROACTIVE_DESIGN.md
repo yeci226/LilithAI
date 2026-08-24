@@ -47,7 +47,7 @@ The first three are available directly in the Lilith settings tab.
 - The settings content uses Unity's native `ScrollRect`; periodic discovery does not reset the scroll origin.
 - Opening settings preserves the player's selected tab.
 - Cloned native labels have their inherited localization behaviours disabled before custom text is assigned.
-- The chat window reuses the native confirm and refuse buttons without hard-coded replacement geometry.
+- The chat window maps the verified native NamingView confirm/refuse buttons by hierarchy and lays them out with their native sizes.
 
 ## Failure containment
 
@@ -60,6 +60,6 @@ The first three are available directly in the Lilith settings tab.
 
 ## Verification
 
-`tests/LilithAISmoke.csproj` covers configuration migration, memory recovery, source compatibility, proactive policy, reply parsing, provider retry behaviour, JSON mode, response content shapes, speech fallback, and TTS policy. GitHub Actions runs it on every push and pull request.
+`tests/LilithAISmoke.csproj` covers configuration migration, memory recovery, source compatibility, proactive policy, reply parsing, provider retry behaviour, JSON mode, response content shapes, speech fallback, and TTS policy. GitHub Actions runs it on every push and pull request. `scripts/Test-PluginInterop.ps1` separately compiles `Plugin.cs` against the local BepInEx and Unity interop assemblies.
 
 Unity hierarchy, scaling, pointer input, and native dialogue interaction still require an in-game smoke pass because the game assemblies and live scene are not available to the protocol test project.

@@ -10,6 +10,13 @@ var sourcedMessage = JsonSerializer.Deserialize<ChatMessage>(JsonSerializer.Seri
     new ChatMessage("assistant", "game line", ConversationSources.Game)));
 if (legacyMessage?.Source != string.Empty || sourcedMessage?.Source != ConversationSources.Game)
     throw new InvalidOperationException("Conversation source compatibility self-test failed");
+if (ConversationSources.Normalize("user", "") != ConversationSources.Player ||
+    ConversationSources.Normalize("assistant", "") != ConversationSources.Legacy ||
+    ConversationSources.Normalize("assistant", ConversationSources.Ai) != ConversationSources.Ai ||
+    ConversationSources.Normalize("assistant", ConversationSources.Game) != ConversationSources.Game ||
+    ConversationSources.Normalize("user", ConversationSources.Game) != ConversationSources.Player ||
+    ConversationSources.Normalize("assistant", "unknown") != ConversationSources.Legacy)
+    throw new InvalidOperationException("Conversation source normalization self-test failed");
 var configTestDirectory = Path.Combine(Path.GetTempPath(), $"LilithAI-config-{Guid.NewGuid():N}");
 Directory.CreateDirectory(configTestDirectory);
 try
@@ -52,12 +59,6 @@ finally
     if (Directory.Exists(memoryTestDirectory))
         Directory.Delete(memoryTestDirectory, true);
 }
-if (UiMath.MouseWheelDelta(120L << 16) != 120 ||
-    UiMath.MouseWheelDelta((long)unchecked((ushort)(short)-120) << 16) != -120 ||
-    UiMath.ClampScrollOffset(-10f, 300f, 100f) != 0f ||
-    UiMath.ClampScrollOffset(250f, 300f, 100f) != 200f ||
-    UiMath.ClampScrollOffset(20f, 80f, 100f) != 0f)
-    throw new InvalidOperationException("Tray scroll bounds self-test failed");
 if (TtsClient.VoicePlaybackDelayFrames != 2 ||
     TtsClient.ShouldStopLocalVoiceHosts(VoiceMode.Japanese, true) ||
     !TtsClient.ShouldStopLocalVoiceHosts(VoiceMode.Off, true) ||
@@ -127,6 +128,8 @@ if (AiCommandProtocol.ResolveExplicitClothing("Tell me about pajamas", "Pajamas 
     throw new InvalidOperationException("Explicit AI action policy self-test failed");
 if (!AiReply.TryParseValidated("plain reply", out var plainReply) || plainReply.Text != "plain reply" ||
     AiReply.TryParseValidated("{\"action\":\"Greet\"}", out _) ||
+    AiReply.TryParseValidated("{\"text\":\"\",\"action\":\"None\"}", out _) ||
+    AiReply.TryParseValidated("{\"text\":\"unterminated", out _) ||
     !AiClient.IsRetryableStatusCode(408) || !AiClient.IsRetryableStatusCode(429) || !AiClient.IsRetryableStatusCode(503) ||
     AiClient.IsRetryableStatusCode(400) || AiClient.IsRetryableStatusCode(401))
     throw new InvalidOperationException("AI response validation and retry policy self-test failed");

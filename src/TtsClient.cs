@@ -53,14 +53,6 @@ public static class RuntimeStage
     }
 }
 
-public static class UiMath
-{
-    public static int MouseWheelDelta(long wParam) => unchecked((short)(wParam >> 16));
-
-    public static float ClampScrollOffset(float offset, float contentHeight, float viewportHeight) =>
-        Math.Clamp(offset, 0f, Math.Max(0f, contentHeight - viewportHeight));
-}
-
 public static class TtsClient
 {
     public const int VoicePlaybackDelayFrames = 2;

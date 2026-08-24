@@ -70,6 +70,7 @@ BepInEx\plugins\LilithAI.dll
 
 ```powershell
 dotnet build .\LilithAI.sln -c Release -p:GameDir="D:\SteamLibrary\steamapps\common\The NOexistenceN of Lilith"
+.\scripts\Test-PluginInterop.ps1 -GameDir "D:\SteamLibrary\steamapps\common\The NOexistenceN of Lilith"
 $env:DOTNET_ROLL_FORWARD='Major'
 dotnet run --project .\tests\LilithAISmoke.csproj -c Release --no-build
 .\scripts\Build-Release.ps1

@@ -160,6 +160,15 @@ public static class ConversationSources
     public const string Ai = "ai";
     public const string Game = "game";
     public const string Legacy = "legacy";
+
+    public static string Normalize(string role, string? source) => source switch
+    {
+        Player when role == "user" => Player,
+        Ai when role == "assistant" => Ai,
+        Game when role == "assistant" => Game,
+        Legacy => Legacy,
+        _ => role == "user" ? Player : Legacy,
+    };
 }
 
 public sealed record ChatMessage(string Role, string Content, string Source = "");
@@ -738,7 +747,9 @@ public static class AiClient
 
     private static TimeSpan RetryDelay(HttpResponseMessage response)
     {
-        var seconds = response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 0.25;
+        var retryAfter = response.Headers.RetryAfter;
+        var seconds = retryAfter?.Delta?.TotalSeconds ??
+                      (retryAfter?.Date is { } date ? (date - DateTimeOffset.UtcNow).TotalSeconds : 0.25);
         return TimeSpan.FromSeconds(Math.Clamp(seconds, 0.1, 30));
     }
 
@@ -877,7 +888,7 @@ public static class AiClient
         if (!string.IsNullOrWhiteSpace(apiKey))
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey.Trim());
         if (provider == ProviderKind.Gemini)
-            request.Headers.TryAddWithoutValidation("x-goog-api-client", "lilith-ai/0.13.0");
+            request.Headers.TryAddWithoutValidation("x-goog-api-client", "lilith-ai/0.13.1");
         if (provider == ProviderKind.OpenRouter)
             request.Headers.TryAddWithoutValidation("X-OpenRouter-Title", "Lilith AI");
         return request;

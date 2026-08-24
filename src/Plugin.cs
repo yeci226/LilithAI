@@ -5,6 +5,7 @@ using BepInEx.Unity.IL2CPP;
 using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.Attributes;
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using TMPro;
@@ -117,6 +118,12 @@ public sealed class ModSettings
     public string ChineseVoiceHostPath => Environment.ExpandEnvironmentVariables(_chineseVoiceHostPath.Value.Trim());
     public string IrodoriPythonPath => Environment.ExpandEnvironmentVariables(_irodoriPythonPath.Value.Trim());
 
+    public void SetAutoStartVoiceService(bool enabled)
+    {
+        _autoStartVoiceService.Value = enabled;
+        _config.Save();
+    }
+
     public void Save(ProviderKind provider, string baseUrl, string model, string apiKey, string prompt, VoiceMode voice)
     {
         _provider.Value = provider.ToString();
@@ -172,14 +179,22 @@ public sealed class Controller : MonoBehaviour
     private ModSettings _settings = null!;
     private CancellationTokenSource? _lifetime;
     private Task<AiReply>? _request;
+    private readonly ConcurrentQueue<AiRequestProgress> _requestProgress = new();
     private bool _requestIsProactive;
     private string _requestUserText = string.Empty;
     private float _nextProactiveAt;
     private AiReply? _pendingReply;
+    private AiReply? _pendingTurnReply;
     private readonly Queue<AiReply> _pendingReplySegments = new();
+    private AudioClip? _pendingSpeechClip;
+    private bool _pendingSpeechAttempted;
+    private int _dialogueRetryAttempts;
+    private float _dialogueRetryAt;
     private string _input = string.Empty;
     private string _apiKey = string.Empty;
     private string _status = "Ready";
+    private string _retryDraft = string.Empty;
+    private bool _lastRequestFailed;
     private ProviderKind _provider;
     private string _baseUrl = string.Empty;
     private string _model = string.Empty;
@@ -189,8 +204,13 @@ public sealed class Controller : MonoBehaviour
     private string _lastGameLanguage = string.Empty;
     private TraySettingNewView? _settingsView;
     private GameObject? _trayCustomRoot;
+    private GameObject? _trayVoiceRoot;
     private RectTransform? _trayContent;
     private RectTransform? _trayViewport;
+    private RectTransform? _trayAiContent;
+    private RectTransform? _trayVoiceContent;
+    private float _trayAiNativeContentHeight;
+    private float _trayVoiceNativeContentHeight;
     private float _trayContentTop;
     private float _trayScrollOffset;
     private bool _trayScrollReady;
@@ -207,12 +227,15 @@ public sealed class Controller : MonoBehaviour
     private TMP_Text? _trayHeaderLabel;
     private TMP_Text? _trayProviderValue;
     private TMP_Text? _trayModelValue;
+    private TMP_Text? _trayVoiceHeaderLabel;
     private TMP_Text? _trayVoiceValue;
+    private TMP_Text? _trayVoiceRestartValue;
     private CharacterInteractionHandler? _interactionHandler;
     private PlayerLineController? _playerLineMenu;
     private Button? _aiMenuButton;
     private Transform? _chatRoot;
     private TMP_InputField? _chatInput;
+    private TMP_Text? _chatTitle;
     private Button? _chatSendButton;
     private Button? _chatCancelButton;
     private UnityAction? _headerAction;
@@ -223,6 +246,7 @@ public sealed class Controller : MonoBehaviour
     private UnityAction? _nextModelAction;
     private UnityAction? _previousVoiceAction;
     private UnityAction? _nextVoiceAction;
+    private UnityAction? _toggleAutoStartVoiceAction;
     private UnityAction<string>? _focusGameWindowAction;
     private UnityAction<string>? _endKeyboardInputAction;
     private UnityAction<string>? _saveTrayInputAction;
@@ -251,6 +275,10 @@ public sealed class Controller : MonoBehaviour
     private Process? _voiceHostProcess;
     private VoiceMode _voiceHostMode;
     private bool _voiceHostLaunchAttempted;
+    private string _voiceHostConfiguration = string.Empty;
+    private int _voiceHostRestartAttempts;
+    private float _voiceHostRetryAt;
+    private float _voiceHostStartedAt;
     private volatile bool _voiceHostReady;
     private volatile bool _voiceHostFailed;
     private CancellationTokenSource? _japaneseWarmupLifetime;
@@ -285,6 +313,7 @@ public sealed class Controller : MonoBehaviour
 
     private void Update()
     {
+        CheckRequestProgress();
         CheckRequest();
         TryStartProactiveDialogue();
         CheckModelListRequest();
@@ -304,6 +333,7 @@ public sealed class Controller : MonoBehaviour
         {
             _lastSettingsScanFrame = Time.frameCount;
             RunOptionalStage(nameof(EnsureTraySettings), EnsureTraySettings);
+            RunOptionalStage(nameof(EnsureLanguageVoiceSettings), EnsureLanguageVoiceSettings);
             RunOptionalStage(nameof(EnsureChatIntegration), EnsureChatIntegration);
             RunOptionalStage(nameof(EnsureLocalVoiceHost), EnsureLocalVoiceHost);
             RunOptionalStage(nameof(RefreshVoiceLabel), RefreshVoiceLabel);
@@ -314,6 +344,20 @@ public sealed class Controller : MonoBehaviour
     [HideFromIl2Cpp]
     private void RunOptionalStage(string name, Action action) =>
         RuntimeStage.TryRunOptional(name, action, _disabledOptionalStages, message => Plugin.LogSource.LogWarning(message));
+
+    [HideFromIl2Cpp]
+    private void CheckRequestProgress()
+    {
+        AiRequestProgress? latest = null;
+        while (_requestProgress.TryDequeue(out var progress))
+            latest = progress;
+        if (latest == null)
+            return;
+
+        _status = latest.Message;
+        if (_chatRoot?.gameObject.activeSelf == true)
+            RefreshChatUiState();
+    }
 
     private void OnDestroy()
     {
@@ -329,6 +373,8 @@ public sealed class Controller : MonoBehaviour
         _voiceLifetime?.Dispose();
         if (_speechClip != null)
             UnityEngine.Object.Destroy(_speechClip);
+        if (_pendingSpeechClip != null)
+            UnityEngine.Object.Destroy(_pendingSpeechClip);
         StopLocalVoiceHosts();
         _lifetime?.Cancel();
         _lifetime?.Dispose();
@@ -365,6 +411,7 @@ public sealed class Controller : MonoBehaviour
     private void StartRequest(string userText, bool proactive, string memoryQuery)
     {
         _status = "Thinking...";
+        _lastRequestFailed = false;
         _requestIsProactive = proactive;
         _requestUserText = userText;
         _request = AiClient.SendAsync(
@@ -378,7 +425,8 @@ public sealed class Controller : MonoBehaviour
             _settings.TimeoutSeconds,
             _lifetime!.Token,
             message => Plugin.LogSource.LogInfo(message),
-            TtsClient.SpokenLanguage(_voiceMode));
+            TtsClient.RequiredSpeechLanguage(_voiceMode, ProviderProfiles.LanguageCode(GameSetting.Language)),
+            progress => _requestProgress.Enqueue(progress));
     }
 
     [HideFromIl2Cpp]
@@ -536,34 +584,48 @@ public sealed class Controller : MonoBehaviour
         try
         {
             var reply = _request.GetAwaiter().GetResult();
-            if (!_requestIsProactive)
+            if (_requestIsProactive)
             {
-                var resolvedClothing = AiCommandProtocol.ResolveClothing(_requestUserText, reply.Text, reply.Clothing);
+                reply = reply with { Clothing = "None", Command = "None", Argument = string.Empty };
+            }
+            else
+            {
+                var resolvedClothing = AiCommandProtocol.ResolveExplicitClothing(_requestUserText, reply.Text, reply.Clothing);
+                var resolvedCommand = AiCommandProtocol.ResolveCommand(_requestUserText, reply.Command);
                 if (reply.Clothing != resolvedClothing)
                 {
                     reply = reply with { Clothing = resolvedClothing };
                     Plugin.LogSource.LogInfo($"AI clothing resolved from reply confirmation: {resolvedClothing}");
                 }
+                if (reply.Command != resolvedCommand)
+                {
+                    reply = reply with { Command = resolvedCommand, Argument = resolvedCommand == "None" ? string.Empty : reply.Argument };
+                    Plugin.LogSource.LogInfo($"AI command resolved from explicit user intent: {resolvedCommand}");
+                }
             }
-            if (LongTermMemoryStore.Remember(_longTermMemory, reply.Memory, DateTimeOffset.Now))
-            {
-                SaveLongTermMemory();
-                Plugin.LogSource.LogInfo("Saved one long-term memory");
-            }
-            Remember("assistant", reply.Text);
             var segments = _voiceMode == VoiceMode.Off && reply.InlineActions.Length == 0
                 ? new[] { reply }
                 : TtsClient.SplitForSpeech(reply);
+            _pendingTurnReply = reply;
             _pendingReply = segments[0];
+            _pendingSpeechAttempted = false;
+            _pendingSpeechClip = null;
+            _dialogueRetryAttempts = 0;
+            _dialogueRetryAt = 0f;
             foreach (var segment in segments.Skip(1))
                 _pendingReplySegments.Enqueue(segment);
             if (segments.Length > 1)
                 Plugin.LogSource.LogInfo($"Split AI reply into {segments.Length} dialogue segments");
             _status = "Reply ready";
+            _lastRequestFailed = false;
+            _retryDraft = string.Empty;
         }
         catch (Exception exception)
         {
-            _status = exception is OperationCanceledException ? "Request cancelled" : exception.Message;
+            var cancelledByShutdown = exception is OperationCanceledException && _lifetime?.IsCancellationRequested == true;
+            _status = cancelledByShutdown
+                ? "Request cancelled"
+                : exception is OperationCanceledException ? "Request timed out" : exception.Message;
             Plugin.LogSource.LogWarning(exception.Message);
             if (!_requestIsProactive && _history.Count > 0 && _history[^1].Role == "user" &&
                 _history[^1].Content == _requestUserText)
@@ -571,18 +633,26 @@ public sealed class Controller : MonoBehaviour
                 _history.RemoveAt(_history.Count - 1);
                 SaveHistory();
             }
-            if (exception is not OperationCanceledException && !_requestIsProactive)
-                _pendingReply = new AiReply(T(
+            if (!cancelledByShutdown && !_requestIsProactive)
+            {
+                _retryDraft = _requestUserText;
+                _lastRequestFailed = true;
+                StopThinking();
+                if (!OpenChatForRetry())
+                    _pendingReply = new AiReply(T(
                     "AI 回應失敗，請檢查連線與設定。",
                     "AI 回复失败，请检查连接和设置。",
                     "AIの応答に失敗しました。接続と設定を確認してください。",
                     "AI response failed. Check your connection and settings."), LilithActionType.Confuse.ToString());
+            }
         }
         finally
         {
             _request = null;
             _requestIsProactive = false;
             _requestUserText = string.Empty;
+            if (_lastRequestFailed)
+                OpenChatForRetry();
             if (_pendingReply == null)
                 StopThinking();
         }
@@ -657,6 +727,22 @@ public sealed class Controller : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
+    private void CommitPendingTurn()
+    {
+        var reply = _pendingTurnReply;
+        if (reply == null)
+            return;
+        _pendingTurnReply = null;
+
+        Remember("assistant", reply.Text);
+        if (LongTermMemoryStore.Remember(_longTermMemory, reply.Memory, DateTimeOffset.Now))
+        {
+            SaveLongTermMemory();
+            Plugin.LogSource.LogInfo("Saved one long-term memory after the dialogue was accepted");
+        }
+    }
+
+    [HideFromIl2Cpp]
     private void ShowThinking()
     {
         var manager = DialogueManager.instance;
@@ -707,9 +793,21 @@ public sealed class Controller : MonoBehaviour
             if (_pendingReplySegments.Count == 0)
                 return;
             _pendingReply = _pendingReplySegments.Dequeue();
+            _pendingSpeechAttempted = false;
+            _pendingSpeechClip = null;
+            _dialogueRetryAttempts = 0;
+            _dialogueRetryAt = 0f;
         }
 
-        var manager = DialogueManager.instance;
+        if (_speechRequest != null)
+            return;
+        if (_pendingSpeechAttempted)
+        {
+            ShowDialogue(_pendingReply, _pendingSpeechClip);
+            return;
+        }
+
+        _pendingSpeechAttempted = true;
         if (_voiceMode != VoiceMode.Off)
         {
             var speech = TtsClient.SelectSpeech(_voiceMode, _pendingReply, ProviderProfiles.LanguageCode(GameSetting.Language));
@@ -719,37 +817,51 @@ public sealed class Controller : MonoBehaviour
                 _status = "Preparing voice...";
                 return;
             }
+            Plugin.LogSource.LogWarning($"AI omitted {_voiceMode} speech; text chat continues without TTS");
         }
 
-        if (manager == null || manager.IsBusyOrAwaitingResponse)
-            return;
-        if (_voiceMode != VoiceMode.Off)
-            Plugin.LogSource.LogWarning($"AI omitted {_voiceMode} speech; text chat continues without TTS");
-
-        var reply = _pendingReply;
-        _pendingReply = null;
-        ShowDialogue(reply);
+        ShowDialogue(_pendingReply);
     }
 
     [HideFromIl2Cpp]
-    private void ShowDialogue(AiReply reply, AudioClip? speechClip = null)
+    private bool ShowDialogue(AiReply reply, AudioClip? speechClip = null)
     {
+        if (Time.unscaledTime < _dialogueRetryAt)
+            return false;
+
         var manager = DialogueManager.instance;
         if (manager == null || manager.IsBusyOrAwaitingResponse)
         {
             _status = "Dialogue system is busy";
-            return;
+            return false;
         }
 
-        StopThinking();
         var action = LilithActionType.None;
         if (Enum.TryParse<LilithActionType>(reply.Action, true, out var requested) && AllowedActions.Contains(requested))
             action = requested;
 
         var shown = manager.Say(reply.Text, action, string.Empty, TtsClient.DialogueDuration(speechClip?.length ?? 0f));
+        if (!shown)
+        {
+            _dialogueRetryAttempts++;
+            _dialogueRetryAt = Time.unscaledTime + Math.Min(2f, 0.25f * _dialogueRetryAttempts);
+            _status = "Game rejected the dialogue; waiting to retry";
+            if (_dialogueRetryAttempts == 1 || _dialogueRetryAttempts % 10 == 0)
+                Plugin.LogSource.LogWarning($"Dialogue rejected before commit; retaining reply for retry, action={action}, attempt={_dialogueRetryAttempts}");
+            return false;
+        }
+
+        StopThinking();
+        if (_pendingReplySegments.Count == 0)
+            CommitPendingTurn();
+        _pendingReply = null;
+        _pendingSpeechClip = null;
+        _pendingSpeechAttempted = false;
+        _dialogueRetryAttempts = 0;
+        _dialogueRetryAt = 0f;
         if (speechClip != null || _voiceMode != VoiceMode.Off && action == LilithActionType.None)
             AudioManager.StopVoice();
-        _status = shown ? "Displayed in game" : "Game rejected the dialogue";
+        _status = "Displayed in game";
         ApplyClothing(reply.Clothing);
         ExecuteAiCommand(reply.Command, reply.Argument);
         Plugin.LogSource.LogInfo($"Dialogue shown={shown}, action={action}, clothing={reply.Clothing}, command={reply.Command}, argument={reply.Argument}");
@@ -764,6 +876,7 @@ public sealed class Controller : MonoBehaviour
         }
         else if (speechClip != null)
             UnityEngine.Object.Destroy(speechClip);
+        return true;
     }
 
     [HideFromIl2Cpp]
@@ -1010,13 +1123,8 @@ public sealed class Controller : MonoBehaviour
         if (_speechRequest is not { IsCompleted: true } request)
             return;
 
-        var manager = DialogueManager.instance;
-        if (_pendingReply != null && (manager == null || manager.IsBusyOrAwaitingResponse))
-            return;
-
         _speechRequest = null;
         var reply = _pendingReply;
-        _pendingReply = null;
         if (reply == null)
             return;
 
@@ -1025,6 +1133,7 @@ public sealed class Controller : MonoBehaviour
         {
             var wav = request.GetAwaiter().GetResult();
             clip = CreateAudioClipFromWav(wav);
+            _pendingSpeechClip = clip;
             var synthesisSeconds = _speechTimer?.Elapsed.TotalSeconds ?? 0d;
             Plugin.LogSource.LogInfo($"TTS synthesis completed in {synthesisSeconds:0.00}s; audio duration={clip.length:0.00}s");
         }
@@ -1035,7 +1144,7 @@ public sealed class Controller : MonoBehaviour
         {
             Plugin.LogSource.LogWarning($"TTS unavailable; text chat continues: {exception.Message}");
         }
-        ShowDialogue(reply, clip);
+        _status = clip == null ? "Voice unavailable; displaying text" : "Voice ready";
     }
 
     [HideFromIl2Cpp]
@@ -1183,22 +1292,6 @@ public sealed class Controller : MonoBehaviour
             return;
         }
 
-        if (_voiceHostProcess != null)
-        {
-            try
-            {
-                if (!_voiceHostProcess.HasExited && _voiceHostMode == _voiceMode)
-                    return;
-            }
-            catch
-            {
-            }
-            StopLocalVoiceHost();
-        }
-        if (_voiceHostLaunchAttempted)
-            return;
-
-        _voiceHostLaunchAttempted = true;
         try
         {
             var japanese = _voiceMode == VoiceMode.Japanese;
@@ -1217,19 +1310,83 @@ public sealed class Controller : MonoBehaviour
                 : null;
             if (bundledPython != null)
                 executable = bundledPython;
+            var reference = japanese ? _settings.JapaneseVoiceReference : _settings.ChineseVoiceReference;
+            var configuration = $"{_voiceMode}|{endpoint}|{executable}|{reference}";
+            if (_voiceHostConfiguration.Length > 0 && !string.Equals(_voiceHostConfiguration, configuration, StringComparison.OrdinalIgnoreCase))
+            {
+                StopLocalVoiceHost();
+                ResetVoiceHostRestartState();
+            }
+
+            if (_voiceHostProcess != null && _voiceHostMode == _voiceMode &&
+                string.Equals(_voiceHostConfiguration, configuration, StringComparison.OrdinalIgnoreCase))
+            {
+                var exited = false;
+                try
+                {
+                    exited = _voiceHostProcess.HasExited;
+                }
+                catch
+                {
+                    exited = true;
+                }
+                if (!exited)
+                {
+                    if (_voiceHostStartedAt > 0f && Time.unscaledTime - _voiceHostStartedAt >= 30f)
+                        _voiceHostRestartAttempts = 0;
+                    return;
+                }
+
+                var exitedProcess = _voiceHostProcess;
+                _voiceHostProcess = null;
+                exitedProcess.Dispose();
+                _voiceHostReady = false;
+                _voiceHostFailed = true;
+                _voiceHostLaunchAttempted = false;
+                if (RefuseOccupiedVoiceHostEndpoint(endpointUri))
+                    return;
+                _voiceHostRestartAttempts++;
+                if (!TtsClient.ShouldRestartLocalVoiceHost(
+                        _voiceMode,
+                        _settings.AutoStartVoiceService,
+                        false,
+                        _voiceHostMode,
+                        _voiceHostRestartAttempts,
+                        Time.unscaledTime,
+                        _voiceHostRetryAt))
+                {
+                    _voiceHostLaunchAttempted = true;
+                    Plugin.LogSource.LogWarning($"Local {_voiceHostMode} TTS service exited; automatic restart limit reached");
+                    return;
+                }
+
+                var delay = TtsClient.VoiceHostRestartDelaySeconds(_voiceHostRestartAttempts);
+                _voiceHostRetryAt = Time.unscaledTime + delay;
+                Plugin.LogSource.LogWarning($"Local {_voiceHostMode} TTS service exited unexpectedly; retry {_voiceHostRestartAttempts}/{TtsClient.MaxVoiceHostRestartAttempts} in {delay:0}s");
+                return;
+            }
+
+            if (_voiceHostProcess != null)
+            {
+                StopLocalVoiceHost();
+                ResetVoiceHostRestartState();
+            }
+            if (Time.unscaledTime < _voiceHostRetryAt || _voiceHostLaunchAttempted)
+                return;
             if (!File.Exists(executable))
             {
                 Plugin.LogSource.LogInfo($"{_voiceMode} TTS runtime is not installed: {executable}");
                 _voiceHostLaunchAttempted = false;
                 return;
             }
-            var reference = japanese ? _settings.JapaneseVoiceReference : _settings.ChineseVoiceReference;
             if (!File.Exists(reference))
             {
                 Plugin.LogSource.LogInfo($"{_voiceMode} TTS reference voice is not installed: {reference}");
                 _voiceHostLaunchAttempted = false;
                 return;
             }
+            if (RefuseOccupiedVoiceHostEndpoint(endpointUri))
+                return;
 
             var startInfo = new ProcessStartInfo
             {
@@ -1258,9 +1415,12 @@ public sealed class Controller : MonoBehaviour
                 if (Directory.Exists(bundledDotnet))
                     startInfo.Environment["DOTNET_ROOT"] = bundledDotnet;
             }
+            _voiceHostLaunchAttempted = true;
             _voiceHostProcess = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("The local TTS process did not start.");
             _voiceHostMode = _voiceMode;
+            _voiceHostConfiguration = configuration;
+            _voiceHostStartedAt = Time.unscaledTime;
             _voiceHostReady = !japanese;
             _voiceHostFailed = false;
             Plugin.LogSource.LogInfo($"Started local {_voiceMode} TTS service");
@@ -1272,6 +1432,20 @@ public sealed class Controller : MonoBehaviour
             _voiceHostFailed = true;
             Plugin.LogSource.LogWarning($"Could not start local {_voiceMode} TTS service: {exception.Message}");
         }
+    }
+
+    [HideFromIl2Cpp]
+    private bool RefuseOccupiedVoiceHostEndpoint(Uri endpoint)
+    {
+        if (!TtsClient.IsLocalPortListening(endpoint))
+            return false;
+
+        _voiceHostLaunchAttempted = true;
+        _voiceHostReady = false;
+        _voiceHostFailed = true;
+        Plugin.LogSource.LogWarning(
+            $"Local {_voiceMode} TTS endpoint {endpoint} is already occupied; refusing to launch a duplicate service. Exit the game to terminate a parent-bound orphan before retrying.");
+        return true;
     }
 
     [HideFromIl2Cpp]
@@ -1346,9 +1520,35 @@ public sealed class Controller : MonoBehaviour
     private void StopLocalVoiceHosts()
     {
         StopLocalVoiceHost();
+        ResetVoiceHostRestartState();
+    }
+
+    [HideFromIl2Cpp]
+    private void ResetVoiceHostRestartState()
+    {
         _voiceHostLaunchAttempted = false;
+        _voiceHostConfiguration = string.Empty;
+        _voiceHostRestartAttempts = 0;
+        _voiceHostRetryAt = 0f;
+        _voiceHostStartedAt = 0f;
         _voiceHostReady = false;
         _voiceHostFailed = false;
+    }
+
+    [HideFromIl2Cpp]
+    private void EnsureTrayActions()
+    {
+        _headerAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NoOp));
+        _previousProviderAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(PreviousProvider));
+        _nextProviderAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NextProvider));
+        _previousModelAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(PreviousModel));
+        _nextModelAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NextModel));
+        _previousVoiceAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(PreviousVoice));
+        _nextVoiceAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NextVoice));
+        _toggleAutoStartVoiceAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(ToggleAutoStartVoice));
+        _focusGameWindowAction ??= DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(FocusGameWindow));
+        _endKeyboardInputAction ??= DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(EndKeyboardInput));
+        _saveTrayInputAction ??= DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(SaveTrayInput));
     }
 
     [HideFromIl2Cpp]
@@ -1362,14 +1562,27 @@ public sealed class Controller : MonoBehaviour
         {
             if (_trayCustomRoot != null)
                 UnityEngine.Object.Destroy(_trayCustomRoot);
+            if (_trayVoiceRoot != null)
+                UnityEngine.Object.Destroy(_trayVoiceRoot);
             _trayCustomRoot = null;
+            _trayVoiceRoot = null;
             _trayHeaderLabel = null;
             _trayProviderValue = null;
             _trayBaseUrlInput = null;
             _trayModelValue = null;
+            _trayVoiceHeaderLabel = null;
             _trayVoiceValue = null;
+            _trayVoiceRestartValue = null;
             _trayApiKeyInput = null;
             _trayPromptInput = null;
+            _trayContent = null;
+            _trayViewport = null;
+            _trayAiContent = null;
+            _trayVoiceContent = null;
+            _trayAiNativeContentHeight = 0f;
+            _trayVoiceNativeContentHeight = 0f;
+            _trayScrollReady = false;
+            _lastTrayTab = null;
         }
 
         _settingsView = view;
@@ -1380,10 +1593,12 @@ public sealed class Controller : MonoBehaviour
         }
 
         if (_trayCustomRoot != null && _trayHeaderLabel != null && _trayProviderValue != null &&
-            _trayBaseUrlInput != null && _trayModelValue != null && _trayVoiceValue != null &&
-            _trayApiKeyInput != null && _trayPromptInput != null)
+            _trayBaseUrlInput != null && _trayModelValue != null &&
+            _trayApiKeyInput != null && _trayPromptInput != null && _trayAiContent != null)
         {
             _trayCustomRoot.SetActive(true);
+            _trayVoiceRoot?.SetActive(false);
+            ActivateTrayLayout(_trayAiContent, _trayCustomRoot, _trayAiNativeContentHeight);
             return;
         }
 
@@ -1395,21 +1610,16 @@ public sealed class Controller : MonoBehaviour
             var rowsContainer = settingRoot.GetComponent<RectTransform>();
             if (rowsContainer == null || rowsContainer.parent == null)
                 return;
+            var nativeContentHeight = LayoutUtility.GetPreferredHeight(rowsContainer);
+            if (nativeContentHeight <= 0f)
+                nativeContentHeight = rowsContainer.rect.height;
+            nativeContentHeight += 8f;
             var inputTemplate = FindNativeSettingTemplate<SettingInputFieldItem>(view);
             var buttonTemplate = FindNativeSettingTemplate<SettingBigButtonItem>(view);
             if (inputTemplate == null || buttonTemplate == null)
                 throw new InvalidOperationException("TraySettingNew has no reusable input/button setting item");
 
-            _headerAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NoOp));
-            _previousProviderAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(PreviousProvider));
-            _nextProviderAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NextProvider));
-            _previousModelAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(PreviousModel));
-            _nextModelAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NextModel));
-            _previousVoiceAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(PreviousVoice));
-            _nextVoiceAction = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NextVoice));
-            _focusGameWindowAction = DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(FocusGameWindow));
-            _endKeyboardInputAction = DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(EndKeyboardInput));
-            _saveTrayInputAction = DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(SaveTrayInput));
+            EnsureTrayActions();
 
             _trayCustomRoot = new GameObject("LilithAISettings");
             var customRoot = _trayCustomRoot.GetComponent<RectTransform>() ??
@@ -1420,7 +1630,7 @@ public sealed class Controller : MonoBehaviour
             customRoot.anchorMin = new Vector2(0f, 1f);
             customRoot.anchorMax = new Vector2(1f, 1f);
             customRoot.pivot = new Vector2(0.5f, 1f);
-            customRoot.anchoredPosition = Vector2.zero;
+            customRoot.anchoredPosition = new Vector2(0f, -nativeContentHeight);
             customRoot.sizeDelta = Vector2.zero;
             var group = _trayCustomRoot.AddComponent<VerticalLayoutGroup>();
             group.childControlWidth = true;
@@ -1435,6 +1645,7 @@ public sealed class Controller : MonoBehaviour
             var header = CloneButton(buttonTemplate, customRoot, "LilithAIHeaderRow",
                 T("AI 莉莉絲聊天設定", "AI 莉莉丝聊天设置", "AI リリス チャット設定", "Lilith AI Chat Settings"), _headerAction!, false);
             _trayHeaderLabel = header._buttonText;
+            SetFeatureRowHeight(header);
             SetLabel(_trayHeaderLabel, T("AI 莉莉絲聊天設定", "AI 莉莉丝聊天设置", "AI リリス チャット設定", "Lilith AI Chat Settings"));
             _trayHeaderLabel.fontStyle |= FontStyles.Bold;
             _trayHeaderLabel.enableWordWrapping = false;
@@ -1442,16 +1653,15 @@ public sealed class Controller : MonoBehaviour
 
             var provider = CloneButton(buttonTemplate, customRoot, "LilithAIProviderRow", _provider.ToString(), _nextProviderAction!, true);
             _trayProviderValue = provider._buttonText;
+            SetFeatureRowHeight(provider);
             var model = CloneButton(buttonTemplate, customRoot, "LilithAIModelRow", _model, _nextModelAction!, true);
             _trayModelValue = model._buttonText;
-            var voice = CloneButton(buttonTemplate, customRoot, "LilithAIVoiceRow", VoiceModeLabel(), _nextVoiceAction!, true);
-            _trayVoiceValue = voice._buttonText;
-            _trayVoiceValue.enableAutoSizing = true;
-            _trayVoiceValue.fontSizeMin = 10f;
-
+            SetFeatureRowHeight(model);
             _trayBaseUrlInput = CloneInput(inputTemplate, customRoot, "LilithAIBaseUrlRow",
                 T("API 位址", "API 地址", "API URL", "API URL"), _baseUrl);
+            SetInputRowHeight(_trayBaseUrlInput, 56f, 36f);
             _trayApiKeyInput = CloneInput(inputTemplate, customRoot, "LilithAIApiKeyRow", "API Key", _apiKey);
+            SetInputRowHeight(_trayApiKeyInput, 56f, 36f);
             _trayApiKeyInput.contentType = TMP_InputField.ContentType.Password;
             _trayApiKeyInput.ForceLabelUpdate();
             _trayPromptInput = CloneInput(inputTemplate, customRoot, "LilithAIPromptRow",
@@ -1462,17 +1672,14 @@ public sealed class Controller : MonoBehaviour
             if (_trayPromptInput.textComponent != null)
                 _trayPromptInput.textComponent.enableWordWrapping = true;
             SetInputRowHeight(_trayPromptInput, 150f, 110f);
-
+            _trayAiContent = rowsContainer;
+            _trayAiNativeContentHeight = nativeContentHeight;
             Canvas.ForceUpdateCanvases();
             EnsureWheelScrolling(rowsContainer);
             ResetModelsForProvider();
             RefreshLocalizedUi();
             RefreshProviderRows();
-            LayoutRebuilder.ForceRebuildLayoutImmediate(rowsContainer);
-            _trayContentTop = rowsContainer.anchoredPosition.y;
-            _trayScrollOffset = 0f;
-            _trayScrollReady = true;
-            ApplyTrayScroll();
+            ActivateTrayLayout(rowsContainer, _trayCustomRoot, nativeContentHeight);
             Plugin.LogSource.LogInfo("Added Lilith AI controls to TraySettingNewView");
         }
         catch
@@ -1485,8 +1692,102 @@ public sealed class Controller : MonoBehaviour
             _trayBaseUrlInput = null;
             _trayModelValue = null;
             _trayVoiceValue = null;
+            _trayVoiceRestartValue = null;
             _trayApiKeyInput = null;
             _trayPromptInput = null;
+            _trayContent = null;
+            _trayViewport = null;
+            _trayAiContent = null;
+            _trayAiNativeContentHeight = 0f;
+            _trayScrollReady = false;
+            throw;
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private void EnsureLanguageVoiceSettings()
+    {
+        var view = _settingsView ?? UnityEngine.Object.FindObjectOfType<TraySettingNewView>();
+        if (view == null || view._currentTab != TraySettingTab.Language)
+            return;
+
+        if (_trayVoiceRoot != null && _trayVoiceHeaderLabel != null &&
+            _trayVoiceValue != null && _trayVoiceRestartValue != null && _trayVoiceContent != null)
+        {
+            _trayVoiceRoot.SetActive(true);
+            _trayCustomRoot?.SetActive(false);
+            ActivateTrayLayout(_trayVoiceContent, _trayVoiceRoot, _trayVoiceNativeContentHeight);
+            return;
+        }
+
+        try
+        {
+            var settingRoot = view._settingItemRoot;
+            if (settingRoot == null || !view._tabsBuilt)
+                return;
+            var rowsContainer = settingRoot.GetComponent<RectTransform>();
+            if (rowsContainer == null || rowsContainer.parent == null)
+                return;
+            var nativeContentHeight = LayoutUtility.GetPreferredHeight(rowsContainer);
+            if (nativeContentHeight <= 0f)
+                nativeContentHeight = rowsContainer.rect.height;
+            nativeContentHeight += 8f;
+            var buttonTemplate = FindNativeSettingTemplate<SettingBigButtonItem>(view);
+            if (buttonTemplate == null)
+                throw new InvalidOperationException("TraySettingNew has no reusable button setting item");
+
+            EnsureTrayActions();
+            _trayVoiceRoot = new GameObject("LilithAIVoiceSettings");
+            var customRoot = _trayVoiceRoot.GetComponent<RectTransform>() ??
+                             _trayVoiceRoot.AddComponent<RectTransform>();
+            customRoot.SetParent(settingRoot, false);
+            customRoot.anchorMin = new Vector2(0f, 1f);
+            customRoot.anchorMax = new Vector2(1f, 1f);
+            customRoot.pivot = new Vector2(0.5f, 1f);
+            customRoot.anchoredPosition = new Vector2(0f, -nativeContentHeight);
+            customRoot.sizeDelta = Vector2.zero;
+            var group = _trayVoiceRoot.AddComponent<VerticalLayoutGroup>();
+            group.childControlWidth = true;
+            group.childControlHeight = true;
+            group.childForceExpandWidth = true;
+            group.childForceExpandHeight = false;
+            group.spacing = 4f;
+            var fitter = _trayVoiceRoot.AddComponent<ContentSizeFitter>();
+            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            var header = CloneButton(buttonTemplate, customRoot, "LilithAIVoiceHeaderRow",
+                T("AI 語音設定", "AI 语音设置", "AI 音声設定", "Lilith AI Voice Settings"), _headerAction!, false);
+            _trayVoiceHeaderLabel = header._buttonText;
+            SetFeatureRowHeight(header);
+            var voice = CloneButton(buttonTemplate, customRoot, "LilithAIVoiceModeRow", VoiceModeLabel(), _nextVoiceAction!, true);
+            _trayVoiceValue = voice._buttonText;
+            SetFeatureRowHeight(voice);
+            var restart = CloneButton(buttonTemplate, customRoot, "LilithAIVoiceRestartRow", VoiceRestartLabel(), _toggleAutoStartVoiceAction!, true);
+            _trayVoiceRestartValue = restart._buttonText;
+            SetFeatureRowHeight(restart);
+
+            _trayVoiceContent = rowsContainer;
+            _trayVoiceNativeContentHeight = nativeContentHeight;
+            Canvas.ForceUpdateCanvases();
+            EnsureWheelScrolling(rowsContainer);
+            RefreshLocalizedUi();
+            ActivateTrayLayout(rowsContainer, _trayVoiceRoot, nativeContentHeight);
+            Plugin.LogSource.LogInfo("Added Lilith AI voice controls to native Language tab");
+        }
+        catch
+        {
+            if (_trayVoiceRoot != null)
+                UnityEngine.Object.Destroy(_trayVoiceRoot);
+            _trayVoiceRoot = null;
+            _trayVoiceHeaderLabel = null;
+            _trayVoiceValue = null;
+            _trayVoiceRestartValue = null;
+            _trayVoiceContent = null;
+            _trayVoiceNativeContentHeight = 0f;
+            _trayContent = null;
+            _trayViewport = null;
+            _trayScrollReady = false;
             throw;
         }
     }
@@ -1633,23 +1934,38 @@ public sealed class Controller : MonoBehaviour
 
         _chatRoot = UnityEngine.Object.Instantiate(naming._rootTransform, naming._rootTransform.parent);
         _chatRoot.name = "LilithAIChat";
-        _chatInput = _chatRoot.GetComponentInChildren<TMP_InputField>(true);
-        _chatSendButton = _chatRoot.Find("Comfirm")?.GetComponent<Button>();
-        var originalCancel = _chatRoot.Find("Refuse");
-        if (originalCancel != null)
-            originalCancel.gameObject.SetActive(false);
-        if (_chatInput == null || _chatSendButton == null)
+        var clonedNamingView = _chatRoot.GetComponentsInChildren<NamingView>(true).FirstOrDefault();
+        foreach (var view in _chatRoot.GetComponentsInChildren<NamingView>(true))
+            view.enabled = false;
+        _chatInput = clonedNamingView?._nameInputField ??
+                     FindClonedComponent(naming._rootTransform, _chatRoot, naming._nameInputField) ??
+                     _chatRoot.GetComponentInChildren<TMP_InputField>(true);
+        _chatSendButton = clonedNamingView?._confirmButton ??
+                          FindClonedComponent(naming._rootTransform, _chatRoot, naming._confirmButton);
+        var buttons = _chatRoot.GetComponentsInChildren<Button>(true);
+        foreach (var button in buttons)
+        {
+            if (button != _chatSendButton)
+                button.gameObject.SetActive(false);
+        }
+        _chatTitle = FindChatTitle(_chatRoot, _chatInput, buttons);
+        if (_chatSendButton != null)
+        {
+            _chatCancelButton = UnityEngine.Object.Instantiate(_chatSendButton, _chatSendButton.transform.parent);
+            _chatCancelButton.name = "LilithAICancelButton";
+        }
+        if (_chatInput == null || _chatSendButton == null || _chatCancelButton == null || _chatTitle == null)
         {
             UnityEngine.Object.Destroy(_chatRoot.gameObject);
             _chatRoot = null;
+            _chatInput = null;
+            _chatTitle = null;
+            _chatSendButton = null;
+            _chatCancelButton = null;
             return;
         }
-        _chatCancelButton = UnityEngine.Object.Instantiate(_chatSendButton, _chatSendButton.transform.parent);
-        _chatCancelButton.name = "Cancel";
-
-        var title = _chatRoot.Find("Text (TMP)")?.GetComponent<TMP_Text>();
-        if (title != null)
-            SetLabel(title, T("對莉莉絲說", "和莉莉丝说话", "リリスに話しかける", "Talk to Lilith"));
+        _chatTitle.gameObject.SetActive(true);
+        SetLabel(_chatTitle, T("對莉莉絲說", "和莉莉丝说话", "リリスに話しかける", "Talk to Lilith"));
         if (_chatInput.placeholder is TMP_Text placeholder)
         {
             placeholder.text = T("輸入訊息…", "输入消息…", "メッセージを入力…", "Type a message…");
@@ -1674,6 +1990,57 @@ public sealed class Controller : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
+    private static T? FindClonedComponent<T>(Transform sourceRoot, Transform clonedRoot, T? sourceComponent)
+        where T : Component
+    {
+        if (sourceComponent == null)
+            return null;
+
+        var path = new List<int>();
+        var sourceTransform = sourceComponent.transform;
+        while (sourceTransform != sourceRoot)
+        {
+            var parent = sourceTransform.parent;
+            if (parent == null)
+                return null;
+            path.Add(sourceTransform.GetSiblingIndex());
+            sourceTransform = parent;
+        }
+
+        var cloneTransform = clonedRoot;
+        for (var i = path.Count - 1; i >= 0; i--)
+        {
+            var siblingIndex = path[i];
+            if (siblingIndex < 0 || siblingIndex >= cloneTransform.childCount)
+                return null;
+            cloneTransform = cloneTransform.GetChild(siblingIndex);
+        }
+        return cloneTransform.GetComponent<T>();
+    }
+
+    [HideFromIl2Cpp]
+    private static TMP_Text? FindChatTitle(Transform root, TMP_InputField? input, IReadOnlyList<Button> buttons)
+    {
+        if (input == null)
+            return null;
+
+        var candidates = root.GetComponentsInChildren<TMP_Text>(true)
+            .Where(text => text.enabled && text.gameObject.activeSelf &&
+                           text.transform != input.transform &&
+                           !text.transform.IsChildOf(input.transform) &&
+                           buttons.All(button => text.transform != button.transform &&
+                                                !text.transform.IsChildOf(button.transform)))
+            .ToArray();
+        var directCandidates = candidates.Where(text => text.transform.parent == root).ToArray();
+        var pool = directCandidates.Length > 0 ? directCandidates : candidates;
+        return pool
+            .Where(text => text.transform.position.y >= input.transform.position.y)
+            .OrderBy(text => Vector3.Distance(text.transform.position, input.transform.position))
+            .FirstOrDefault() ??
+            pool.OrderBy(text => Vector3.Distance(text.transform.position, input.transform.position)).FirstOrDefault();
+    }
+
+    [HideFromIl2Cpp]
     private static void ConfigureChatButton(Button button, string text, UnityAction action, float x)
     {
         button.gameObject.SetActive(true);
@@ -1688,15 +2055,82 @@ public sealed class Controller : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
+    private bool OpenChatForRetry()
+    {
+        if (_chatRoot == null || _chatInput == null)
+            return false;
+        OpenChat();
+        return _chatRoot.gameObject.activeSelf;
+    }
+
+    [HideFromIl2Cpp]
+    private void RefreshChatUiState()
+    {
+        if (_chatInput == null || _chatSendButton == null || _chatCancelButton == null || _chatTitle == null)
+            return;
+
+        var requestBusy = _request != null;
+        var replyBusy = _pendingReply != null || _pendingReplySegments.Count > 0 || _speechRequest != null;
+        var busy = requestBusy || replyBusy;
+        _chatInput.interactable = !busy;
+        _chatInput.readOnly = busy;
+        _chatSendButton.interactable = !busy;
+
+        if (requestBusy)
+        {
+            var retrying = _status.Contains("retry", StringComparison.OrdinalIgnoreCase);
+            SetLabel(_chatTitle, retrying
+                ? T("連線不穩，正在重試…", "连接不稳，正在重试…", "接続が不安定です。再試行しています…", "Connection interrupted — retrying…")
+                : T("莉莉絲正在想…", "莉莉丝正在想…", "リリスは考え中…", "Lilith is thinking…"));
+            SetButtonLabel(_chatSendButton, T("傳送中…", "发送中…", "送信中…", "Sending…"));
+            SetButtonLabel(_chatCancelButton, T("關閉", "关闭", "閉じる", "Close"));
+            return;
+        }
+
+        if (replyBusy)
+        {
+            SetLabel(_chatTitle, T("莉莉絲正在回應…", "莉莉丝正在回应…", "リリスが返事をしています…", "Lilith is replying…"));
+            SetButtonLabel(_chatSendButton, T("請稍候", "请稍候", "お待ちください", "Please wait"));
+            SetButtonLabel(_chatCancelButton, T("關閉", "关闭", "閉じる", "Close"));
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_model))
+        {
+            _chatSendButton.interactable = false;
+            SetLabel(_chatTitle, T("請先在設定中選擇 AI 模型", "请先在设置中选择 AI 模型", "設定でAIモデルを選んでください", "Choose an AI model in Settings first"));
+            SetButtonLabel(_chatSendButton, T("尚未設定", "尚未设置", "未設定", "Not configured"));
+            SetButtonLabel(_chatCancelButton, T("關閉", "关闭", "閉じる", "Close"));
+            return;
+        }
+
+        if (_lastRequestFailed)
+        {
+            SetLabel(_chatTitle, T("沒有收到回覆，訊息已保留", "没有收到回复，消息已保留", "返事を受け取れませんでした。入力は残っています", "No reply received — your message is preserved"));
+            SetButtonLabel(_chatSendButton, T("重試", "重试", "再試行", "Retry"));
+            SetButtonLabel(_chatCancelButton, T("取消", "取消", "キャンセル", "Cancel"));
+            return;
+        }
+
+        SetLabel(_chatTitle, T("和莉莉絲說話", "和莉莉丝说话", "リリスと話す", "Talk to Lilith"));
+        SetButtonLabel(_chatSendButton, T("傳送", "发送", "送信", "Send"));
+        SetButtonLabel(_chatCancelButton, T("取消", "取消", "キャンセル", "Cancel"));
+    }
+
+    [HideFromIl2Cpp]
     private void OpenChat()
     {
         if (_chatRoot == null || _chatInput == null)
             return;
-        _chatInput.SetTextWithoutNotify(string.Empty);
+        _chatInput.SetTextWithoutNotify(_lastRequestFailed ? _retryDraft : string.Empty);
         _chatRoot.gameObject.SetActive(true);
-        TransparentWindowNew.BeginKeyboardInput();
-        _chatInput.Select();
-        _chatInput.ActivateInputField();
+        RefreshChatUiState();
+        if (_chatInput.interactable)
+        {
+            TransparentWindowNew.BeginKeyboardInput();
+            _chatInput.Select();
+            _chatInput.ActivateInputField();
+        }
     }
 
     [HideFromIl2Cpp]
@@ -1710,11 +2144,15 @@ public sealed class Controller : MonoBehaviour
         _input = _chatInput.text;
         if (Send())
             CloseChat();
+        else
+            RefreshChatUiState();
     }
 
     [HideFromIl2Cpp]
     private void CloseChat()
     {
+        if (_lastRequestFailed && _chatInput != null && !string.IsNullOrWhiteSpace(_chatInput.text))
+            _retryDraft = _chatInput.text;
         _chatInput?.DeactivateInputField();
         if (_chatRoot != null)
             _chatRoot.gameObject.SetActive(false);
@@ -1835,6 +2273,49 @@ public sealed class Controller : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
+    private static void SetFeatureRowHeight(SettingBigButtonItem item)
+    {
+        var row = item.transform.GetComponent<RectTransform>();
+        if (row != null)
+            row.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, 42f);
+        var layout = item.GetComponent<LayoutElement>() ?? item.gameObject.AddComponent<LayoutElement>();
+        layout.minHeight = 42f;
+        layout.preferredHeight = 42f;
+        if (item._buttonText != null)
+        {
+            item._buttonText.enableAutoSizing = true;
+            item._buttonText.fontSizeMin = 9f;
+            item._buttonText.enableWordWrapping = false;
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private static void ApplyTrayCustomGeometry(RectTransform content, RectTransform customRoot, float nativeHeight)
+    {
+        customRoot.anchoredPosition = new Vector2(0f, -nativeHeight);
+        Canvas.ForceUpdateCanvases();
+        LayoutRebuilder.ForceRebuildLayoutImmediate(customRoot);
+        var customHeight = Math.Max(customRoot.rect.height, LayoutUtility.GetPreferredHeight(customRoot));
+        var requiredHeight = Math.Max(content.rect.height, nativeHeight + customHeight);
+        content.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, requiredHeight);
+    }
+
+    [HideFromIl2Cpp]
+    private void ActivateTrayLayout(RectTransform content, GameObject customRoot, float nativeHeight)
+    {
+        var customRect = customRoot.GetComponent<RectTransform>();
+        if (customRect == null)
+            return;
+        EnsureWheelScrolling(content);
+        LayoutRebuilder.ForceRebuildLayoutImmediate(content);
+        ApplyTrayCustomGeometry(content, customRect, nativeHeight);
+        _trayContentTop = content.anchoredPosition.y;
+        _trayScrollOffset = 0f;
+        _trayScrollReady = true;
+        ApplyTrayScroll();
+    }
+
+    [HideFromIl2Cpp]
     private void EnsureWheelScrolling(RectTransform content)
     {
         var viewport = content.parent.GetComponent<RectTransform>();
@@ -1908,6 +2389,18 @@ public sealed class Controller : MonoBehaviour
         Plugin.LogSource.LogInfo($"TTS voice changed to {_voiceMode}");
     }
 
+    [HideFromIl2Cpp]
+    private void ToggleAutoStartVoice()
+    {
+        _settings.SetAutoStartVoiceService(!_settings.AutoStartVoiceService);
+        if (!_settings.AutoStartVoiceService)
+            StopLocalVoiceHosts();
+        else
+            EnsureLocalVoiceHost();
+        RefreshVoiceLabel();
+        RefreshFeatureLabels();
+    }
+
     private string VoiceModeLabel()
     {
         var mode = _voiceMode switch
@@ -1924,6 +2417,19 @@ public sealed class Controller : MonoBehaviour
     {
         if (_trayVoiceValue != null)
             SetTrayValue(_trayVoiceValue, VoiceModeLabel());
+        RefreshFeatureLabels();
+    }
+
+    private string VoiceRestartLabel() =>
+        $"{T("本機語音自動重啟", "本地语音自动重启", "ローカル音声の自動再起動", "Local voice auto-restart")}: " +
+        (_settings.AutoStartVoiceService ? T("開啟", "开启", "オン", "On") : T("關閉", "关闭", "オフ", "Off")) +
+        $" · {VoiceStatusLabel()}";
+
+    [HideFromIl2Cpp]
+    private void RefreshFeatureLabels()
+    {
+        if (_trayVoiceRestartValue != null)
+            SetLabel(_trayVoiceRestartValue, VoiceRestartLabel());
     }
 
     private string VoiceStatusLabel()
@@ -1947,12 +2453,14 @@ public sealed class Controller : MonoBehaviour
             _settings.AutoStartVoiceService,
             running,
             _voiceHostReady,
-            _voiceHostFailed) switch
+            _voiceHostFailed,
+            _voiceHostRetryAt > Time.unscaledTime) switch
         {
             VoiceServiceStatus.Off => T("關閉", "关闭", "オフ", "Off"),
             VoiceServiceStatus.MissingRuntime => T("未安裝語音模型", "未安装语音模型", "音声モデル未導入", "Voice model not installed"),
             VoiceServiceStatus.MissingReference => T("缺少參考音檔", "缺少参考音频", "参照音声が不足", "Reference audio missing"),
             VoiceServiceStatus.ManualStart => T("需手動啟動服務", "需手动启动服务", "手動起動が必要", "Start service manually"),
+            VoiceServiceStatus.Retrying => T("服務即將重啟", "服务即将重启", "サービスを再起動中", "Restarting after crash"),
             VoiceServiceStatus.Ready => T("已開啟", "已开启", "有効", "On"),
             VoiceServiceStatus.Failed => T("啟動失敗，請查看 Log", "启动失败，请查看 Log", "起動失敗・Logを確認", "Start failed; check log"),
             _ => T("啟動中", "启动中", "起動中", "Starting"),
@@ -2047,8 +2555,14 @@ public sealed class Controller : MonoBehaviour
         SetTrayRowVisible(_trayBaseUrlInput, selfHosted);
         SetTrayRowVisible(_trayApiKeyInput, ProviderProfiles.NeedsApiKey(_provider));
         Canvas.ForceUpdateCanvases();
-        LayoutRebuilder.ForceRebuildLayoutImmediate(_trayContent!);
-        ApplyTrayScroll();
+        if (_trayContent != null)
+        {
+            LayoutRebuilder.ForceRebuildLayoutImmediate(_trayContent);
+            var customRoot = _trayCustomRoot?.GetComponent<RectTransform>();
+            if (customRoot != null)
+                ApplyTrayCustomGeometry(_trayContent, customRoot, _trayAiNativeContentHeight);
+            ApplyTrayScroll();
+        }
     }
 
     [HideFromIl2Cpp]
@@ -2075,10 +2589,16 @@ public sealed class Controller : MonoBehaviour
 
         _lastTrayTab = _settingsView._currentTab;
         _trayCustomRoot?.SetActive(_lastTrayTab == TraySettingTab.Lilith);
+        _trayVoiceRoot?.SetActive(_lastTrayTab == TraySettingTab.Language);
         if (_lastTrayTab == TraySettingTab.Lilith)
         {
             RunOptionalStage(nameof(EnsureTraySettings), EnsureTraySettings);
             RefreshProviderRows();
+        }
+        else if (_lastTrayTab == TraySettingTab.Language)
+        {
+            RunOptionalStage(nameof(EnsureLanguageVoiceSettings), EnsureLanguageVoiceSettings);
+            RefreshVoiceLabel();
         }
     }
 
@@ -2219,6 +2739,8 @@ public sealed class Controller : MonoBehaviour
     {
         if (_trayHeaderLabel != null)
             SetLabel(_trayHeaderLabel, T("AI 莉莉絲聊天設定", "AI 莉莉丝聊天设置", "AI リリス チャット設定", "Lilith AI Chat Settings"));
+        if (_trayVoiceHeaderLabel != null)
+            SetLabel(_trayVoiceHeaderLabel, T("AI 語音設定", "AI 语音设置", "AI 音声設定", "Lilith AI Voice Settings"));
         SetTrayLabel(_trayProviderValue, T("供應商", "提供商", "プロバイダー", "Provider"));
         SetTrayLabel(_trayBaseUrlInput, T("API 位址", "API 地址", "API URL", "API URL"));
         SetTrayLabel(_trayModelValue, T("模型", "模型", "モデル", "Model"));
@@ -2227,6 +2749,8 @@ public sealed class Controller : MonoBehaviour
         SetTrayLabel(_trayPromptInput, T("莉莉絲角色設定", "莉莉丝角色设定", "リリスのキャラクター設定", "Lilith Character Prompt"));
         if (_trayVoiceValue != null)
             SetTrayValue(_trayVoiceValue, VoiceModeLabel());
+        if (_trayVoiceRestartValue != null)
+            SetLabel(_trayVoiceRestartValue, VoiceRestartLabel());
 
         if (_trayModelValue != null && _modelListRequest != null)
             SetTrayValue(_trayModelValue, T("讀取模型…", "读取模型…", "モデルを読み込み中…", "Loading models…"));
@@ -2235,17 +2759,14 @@ public sealed class Controller : MonoBehaviour
         else if (_trayModelValue != null && string.IsNullOrWhiteSpace(_model))
             SetTrayValue(_trayModelValue, T("按箭頭讀取", "按箭头读取", "矢印で読み込む", "Use arrows to load"));
 
-        if (_chatRoot != null)
-        {
-            var title = _chatRoot.Find("Text (TMP)")?.GetComponent<TMP_Text>();
-            if (title != null)
-                SetLabel(title, T("對莉莉絲說", "和莉莉丝说话", "リリスに話しかける", "Talk to Lilith"));
-        }
+        if (_chatRoot != null && _chatTitle != null)
+            SetLabel(_chatTitle, T("對莉莉絲說", "和莉莉丝说话", "リリスに話しかける", "Talk to Lilith"));
         if (_chatInput?.placeholder is TMP_Text placeholder)
             placeholder.text = T("輸入訊息…", "输入消息…", "メッセージを入力…", "Type a message…");
         SetButtonLabel(_chatSendButton, T("送出", "发送", "送信", "Send"));
         SetButtonLabel(_chatCancelButton, T("取消", "取消", "キャンセル", "Cancel"));
         SetButtonLabel(_aiMenuButton, T("對莉莉絲說", "和莉莉丝说话", "リリスに話しかける", "Talk to Lilith"));
+        RefreshChatUiState();
     }
 
     [HideFromIl2Cpp]

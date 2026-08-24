@@ -1,3 +1,4 @@
+using System.Net.NetworkInformation;
 using System.Text;
 using System.Text.Json;
 
@@ -17,6 +18,7 @@ public enum VoiceServiceStatus
     MissingReference,
     ManualStart,
     Loading,
+    Retrying,
     Ready,
     Failed,
 }
@@ -57,12 +59,30 @@ public static class UiMath
 public static class TtsClient
 {
     public const int VoicePlaybackDelayFrames = 2;
+    public const int MaxVoiceHostRestartAttempts = 5;
 
     public static bool ShouldRestartInterruptedPlayback(bool playingExpectedClip, float remainingSeconds, bool alreadyRetried) =>
         !playingExpectedClip && remainingSeconds > 0.1f && !alreadyRetried;
 
     public static bool ShouldStopLocalVoiceHosts(VoiceMode mode, bool autoStart) =>
         mode == VoiceMode.Off || !autoStart;
+
+    public static bool ShouldRestartLocalVoiceHost(
+        VoiceMode requestedMode,
+        bool autoStart,
+        bool intentionalStop,
+        VoiceMode exitedHostMode,
+        int restartAttempts,
+        float now,
+        float retryAt) =>
+        !intentionalStop && requestedMode != VoiceMode.Off && autoStart &&
+        exitedHostMode == requestedMode && restartAttempts <= MaxVoiceHostRestartAttempts && now >= retryAt;
+
+    public static float VoiceHostRestartDelaySeconds(int restartAttempt)
+    {
+        var exponent = Math.Clamp(restartAttempt - 1, 0, 4);
+        return Math.Min(60f, 5f * (1 << exponent));
+    }
 
     public static VoiceServiceStatus GetVoiceServiceStatus(
         VoiceMode mode,
@@ -71,7 +91,8 @@ public static class TtsClient
         bool autoStart,
         bool running,
         bool ready,
-        bool failed)
+        bool failed,
+        bool retrying = false)
     {
         if (mode == VoiceMode.Off)
             return VoiceServiceStatus.Off;
@@ -81,6 +102,8 @@ public static class TtsClient
             return VoiceServiceStatus.MissingReference;
         if (!autoStart)
             return VoiceServiceStatus.ManualStart;
+        if (retrying)
+            return VoiceServiceStatus.Retrying;
         if (failed)
             return VoiceServiceStatus.Failed;
         return running && ready ? VoiceServiceStatus.Ready : VoiceServiceStatus.Loading;
@@ -94,6 +117,31 @@ public static class TtsClient
         VoiceMode.Japanese => "Japanese",
         _ => string.Empty,
     };
+
+    public static string RequiredSpeechLanguage(VoiceMode mode, string displayLanguage) =>
+        mode == VoiceMode.Chinese && displayLanguage is "zh-Hant" or "zh-Hans" ||
+        mode == VoiceMode.Japanese && displayLanguage == "ja"
+            ? string.Empty
+            : SpokenLanguage(mode);
+
+    public static bool IsRetryableHttpStatus(int statusCode) => statusCode is >= 500 and <= 599;
+
+    public static bool IsLocalPortListening(Uri endpoint)
+    {
+        if (!endpoint.IsLoopback)
+            return false;
+
+        try
+        {
+            return IPGlobalProperties.GetIPGlobalProperties()
+                .GetActiveTcpListeners()
+                .Any(listener => listener.Port == endpoint.Port);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     public static float DialogueDuration(float speechSeconds) => Math.Max(6f, speechSeconds + 1f);
 
@@ -185,7 +233,12 @@ public static class TtsClient
                 timeout.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 10, 300)));
                 using var response = await Http.SendAsync(request, timeout.Token).ConfigureAwait(false);
                 if (!response.IsSuccessStatusCode)
-                    throw new HttpRequestException($"TTS HTTP {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync().ConfigureAwait(false)}");
+                {
+                    var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (!IsRetryableHttpStatus((int)response.StatusCode))
+                        throw new InvalidOperationException($"TTS HTTP {(int)response.StatusCode}: {body}");
+                    throw new HttpRequestException($"TTS HTTP {(int)response.StatusCode}: {body}");
+                }
                 return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
             }
             catch (HttpRequestException exception) when (attempt < attempts)

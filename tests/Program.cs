@@ -5,6 +5,11 @@ using System.Text.Json;
 using LilithAI;
 
 AiReply.SelfTest();
+var legacyMessage = JsonSerializer.Deserialize<ChatMessage>("{\"Role\":\"assistant\",\"Content\":\"old line\"}");
+var sourcedMessage = JsonSerializer.Deserialize<ChatMessage>(JsonSerializer.Serialize(
+    new ChatMessage("assistant", "game line", ConversationSources.Game)));
+if (legacyMessage?.Source != string.Empty || sourcedMessage?.Source != ConversationSources.Game)
+    throw new InvalidOperationException("Conversation source compatibility self-test failed");
 var configTestDirectory = Path.Combine(Path.GetTempPath(), $"LilithAI-config-{Guid.NewGuid():N}");
 Directory.CreateDirectory(configTestDirectory);
 try
@@ -73,10 +78,17 @@ if (RuntimeStage.TryRunOptional("broken", () =>
         throw new InvalidOperationException("expected smoke failure");
     }, disabledStages, stageLogs.Add) ||
     RuntimeStage.TryRunOptional("broken", () => brokenStageRuns++, disabledStages, stageLogs.Add) ||
+    !RuntimeStage.TryRunOptional("broken", () => brokenStageRuns++, disabledStages, stageLogs.Add) ||
     !RuntimeStage.TryRunOptional("later", () => laterStageRan = true, disabledStages, stageLogs.Add) ||
-    brokenStageRuns != 1 || !laterStageRan || stageLogs.Count != 1 ||
-    !stageLogs[0].Contains("broken") || !stageLogs[0].Contains("other stages continue"))
+    brokenStageRuns != 2 || !laterStageRan || stageLogs.Count != 1 ||
+    !stageLogs[0].Contains("broken") || !stageLogs[0].Contains("will retry") || !stageLogs[0].Contains("other stages continue"))
     throw new InvalidOperationException("Optional runtime stage isolation self-test failed");
+if (!ProactiveDialoguePolicy.ShouldQueue(true, true, true, false, 20, 19) ||
+    ProactiveDialoguePolicy.ShouldQueue(true, true, true, false, 20, 20) ||
+    ProactiveDialoguePolicy.ShouldQueue(true, false, true, false, 100, 0) ||
+    ProactiveDialoguePolicy.ShouldQueue(true, true, false, false, 100, 0) ||
+    ProactiveDialoguePolicy.ShouldQueue(true, true, true, true, 100, 0))
+    throw new InvalidOperationException("Proactive dialogue policy self-test failed");
 var translatedReply = new AiReply("English display", "None", "Chinese speech");
 var splitReply = TtsClient.SplitForSpeech(new AiReply("第一段\n\n第二段", "Greet", "一段目\n\n二段目"));
 var inlineReply = AiReply.Parse("first\n\uFF08\u52D5\u4F5C\uFF1ATiltHead\uFF09\nsecond\n(action: Stretch)");
@@ -171,7 +183,8 @@ if (!TtsClient.ShouldRestartLocalVoiceHost(VoiceMode.Chinese, true, false, Voice
 if (!ProviderProfiles.IsSelfHosted(ProviderKind.Ollama) || ProviderProfiles.IsSelfHosted(ProviderKind.OpenAI) ||
     ProviderProfiles.NeedsApiKey(ProviderKind.Ollama) || !ProviderProfiles.NeedsApiKey(ProviderKind.OpenAI) ||
     string.IsNullOrWhiteSpace(ProviderProfiles.DefaultModel(ProviderKind.OpenAI)) ||
-    ProviderProfiles.DefaultModel(ProviderKind.OpenRouter) != "nvidia/nemotron-nano-9b-v2:free" ||
+    ProviderProfiles.DefaultModel(ProviderKind.OpenRouter) != "openrouter/free" ||
+    !ProviderProfiles.Models(ProviderKind.OpenRouter).Contains(ProviderProfiles.LegacyOpenRouterDefaultModel) ||
     !ProviderProfiles.Models(ProviderKind.OpenRouter).Contains("openrouter/free") ||
     ProviderProfiles.LanguageCode("zh-TW") != "zh-Hant" || ProviderProfiles.LanguageCode("zh-CN") != "zh-Hans" ||
     ProviderProfiles.LanguageCode("ja-JP") != "ja" ||
@@ -203,6 +216,7 @@ catch (InvalidOperationException)
 if (!remoteTtsRejected)
     throw new InvalidOperationException("Remote TTS endpoint self-test failed");
 await Test(ProviderKind.OpenAI, "{\"choices\":[{\"message\":{\"content\":\"{\\\"text\\\":\\\"OpenAI OK\\\",\\\"action\\\":\\\"Greet\\\"}\"}}]}", "OpenAI OK");
+await Test(ProviderKind.OpenAI, "{\"choices\":[{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"array content OK\"}]}}]}", "array content OK");
 await Test(ProviderKind.Anthropic, "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"text\\\":\\\"Claude OK\\\",\\\"action\\\":\\\"Think\\\"}\"}]}", "Claude OK");
 await TestEmptyContentRetry();
 await TestProviderScaffoldingRetry();
@@ -278,6 +292,7 @@ static async Task TestEmptyContentRetry()
     if (reply.Text != "retry OK" || logs.Count(log => log.StartsWith("AI REQUEST")) != 2 ||
         !logs.Any(log => log.StartsWith("AI RETRY")) ||
         !logs.Any(log => log.Contains("\"max_tokens\":512")) ||
+        !logs.Last(log => log.StartsWith("AI REQUEST")).Contains("\"temperature\":0.2") ||
         !logs.Any(log => log.Contains("\"content\":\"/no_think\\ntest prompt\"")) ||
         !logs.Any(log => log.Contains("\"reasoning\":{\"effort\":\"none\",\"exclude\":true}")))
         throw new InvalidOperationException("Empty response retry self-test failed");
@@ -378,7 +393,8 @@ static async Task Test(ProviderKind provider, string responseBody, string expect
     if (!logs.Any(log => log.StartsWith("AI REQUEST")) || !logs.Any(log => log.StartsWith("AI RESPONSE")) ||
         !logs.Any(log => log.StartsWith("AI PARSED")) || !logs.Any(log => log.Contains("Built-in game dialogue")) ||
         logs.Any(log => log.Contains("test-key")) ||
-        provider != ProviderKind.OpenRouter && logs.Any(log => log.Contains("\"reasoning\"")))
+        provider != ProviderKind.OpenRouter && logs.Any(log => log.Contains("\"reasoning\"")) ||
+        provider == ProviderKind.OpenAI && !logs.Any(log => log.Contains("\"response_format\":{\"type\":\"json_object\"}")))
         throw new InvalidOperationException("AI logging self-test failed");
 }
 

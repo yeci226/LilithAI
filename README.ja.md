@@ -60,7 +60,8 @@ BepInEx\plugins\LilithAI.dll
 - API key は `BepInEx/config/LilithAI.cfg` にのみ保存されます。旧設定ファイルは初回起動時に自動で改名されます。
 - 会話履歴は `BepInEx/data/LilithAI/memory.json` に保存されます。
 - 重要な人物、好み、出来事は `long-term-memory.json` に保存されます。両方の記憶ファイルには `.bak` が保持され、メインファイルが破損した場合は自動復旧します。
-- 自発会話は既定で有効、最短クールダウンは30分です。`Companion.ProactiveDialogue` と `Companion.ProactiveCooldownMinutes` で調整できます。
+- 自発会話は、アイドル時間、しばらく離れた後の復帰、リリスの状態変化、ゲーム標準台詞をきっかけに、確率とクールダウンを守って自然に話します。「リリス」設定タブ、または `Companion.ProactiveDialogue`、`Companion.ProactiveChancePercent`、`Companion.ProactiveCooldownMinutes` で調整できます。
+- 会話履歴ではプレイヤー入力、AI 応答、ゲーム標準台詞を区別し、既存履歴は互換性のある legacy 由来として読み込みます。
 - `BepInEx/LogOutput.log` には会話内容が含まれる場合があります。不具合報告に添付する前に確認してください。
 - プレイヤー名は初期設定では送信されません。`Context.IncludePlayerName` で有効にできます。
 - 中国語音声には GPT-SoVITS、日本語音声には [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server) を使用します。

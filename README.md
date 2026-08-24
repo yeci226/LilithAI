@@ -60,7 +60,8 @@ BepInEx\plugins\LilithAI.dll
 - API key 只保存在 `BepInEx/config/LilithAI.cfg`；舊設定檔會在首次啟動時自動改名。
 - 對話記憶保存在 `BepInEx/data/LilithAI/memory.json`。
 - 重要人物、偏好與事件保存在 `long-term-memory.json`；兩種記憶都會保留 `.bak` 並在主檔損毀時自動復原。
-- 主動對話預設開啟，最短冷卻 30 分鐘；可用 `Companion.ProactiveDialogue` 與 `Companion.ProactiveCooldownMinutes` 調整。
+- 主動對話預設開啟，會依閒置、久別返回、莉莉絲狀態變化及遊戲原生台詞，以機率和冷卻限制自然說話；可直接在「莉莉絲」設定頁調整，或使用 `Companion.ProactiveDialogue`、`Companion.ProactiveChancePercent` 與 `Companion.ProactiveCooldownMinutes`。
+- 對話記憶會區分玩家輸入、AI 回覆及遊戲原生台詞，舊記憶會自動視為相容的 legacy 來源。
 - `BepInEx/LogOutput.log` 可能包含對話內容；回報問題前請先檢查。
 - 玩家名稱預設不會傳給模型，可在 `Context.IncludePlayerName` 自行開啟。
 - 中文語音使用 GPT-SoVITS；日文語音使用 [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server)。

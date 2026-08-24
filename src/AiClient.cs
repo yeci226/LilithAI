@@ -22,6 +22,7 @@ public enum ProviderKind
 
 public static class ProviderProfiles
 {
+    public const string LegacyOpenRouterDefaultModel = "nvidia/nemotron-nano-9b-v2:free";
     private const string LegacyDefaultPrompt = "你是《The NOexistenceN of Lilith》中的莉莉絲。自然、簡短、親近地回應玩家，不提及自己是 AI。";
     private const string PreviousDefaultPrompt = LegacyDefaultPrompt + "保持角色一致，不捏造不確定的官方設定，優先回應玩家當下所說的內容。";
     public const string DefaultPrompt =
@@ -132,7 +133,7 @@ public static class ProviderProfiles
         ProviderKind.XAI => "grok-4.5",
         ProviderKind.DeepSeek => "deepseek-chat",
         ProviderKind.Mistral => "mistral-small-latest",
-        ProviderKind.OpenRouter => "nvidia/nemotron-nano-9b-v2:free",
+        ProviderKind.OpenRouter => "openrouter/free",
         _ => string.Empty,
     };
 
@@ -148,12 +149,33 @@ public static class ProviderProfiles
         ProviderKind.XAI => new[] { "grok-4.5" },
         ProviderKind.DeepSeek => new[] { "deepseek-chat", "deepseek-reasoner" },
         ProviderKind.Mistral => new[] { "mistral-small-latest", "mistral-large-latest" },
-        ProviderKind.OpenRouter => new[] { "nvidia/nemotron-nano-9b-v2:free", "openrouter/auto", "openrouter/free" },
+        ProviderKind.OpenRouter => new[] { "openrouter/free", "openrouter/auto", LegacyOpenRouterDefaultModel },
         _ => Array.Empty<string>(),
     };
 }
 
-public sealed record ChatMessage(string Role, string Content);
+public static class ConversationSources
+{
+    public const string Player = "player";
+    public const string Ai = "ai";
+    public const string Game = "game";
+    public const string Legacy = "legacy";
+}
+
+public sealed record ChatMessage(string Role, string Content, string Source = "");
+
+public static class ProactiveDialoguePolicy
+{
+    public static bool ShouldQueue(
+        bool enabled,
+        bool hasModel,
+        bool cooldownReady,
+        bool cuePending,
+        int chancePercent,
+        int roll) =>
+        enabled && hasModel && cooldownReady && !cuePending &&
+        roll >= 0 && roll < Math.Clamp(chancePercent, 0, 100);
+}
 
 public enum AiRequestStage
 {
@@ -580,7 +602,7 @@ public static class AiClient
             using var request = provider == ProviderKind.Anthropic
                 ? BuildAnthropicRequest(baseUrl, apiKey, model, prompt, requestHistory, requestText)
                 : BuildOpenAiRequest(provider, baseUrl, apiKey, model, prompt, requestHistory, requestText,
-                    speechFallback ? string.Empty : requiredSpeechLanguage);
+                    speechFallback ? string.Empty : requiredSpeechLanguage, scaffoldingRetry);
             var requestBody = await request.Content!.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
             log?.Invoke($"AI REQUEST\nMode: {(speechFallback ? "Speech fallback" : "Reply")}\nAttempt: {attempt + 1}\nProvider: {provider}\nModel: {model}\nEndpoint: {request.RequestUri}\nPayload:\n{requestBody}");
             HttpResponseMessage response;
@@ -717,7 +739,7 @@ public static class AiClient
     private static TimeSpan RetryDelay(HttpResponseMessage response)
     {
         var seconds = response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 0.25;
-        return TimeSpan.FromSeconds(Math.Clamp(seconds, 0.1, 2));
+        return TimeSpan.FromSeconds(Math.Clamp(seconds, 0.1, 30));
     }
 
     private static bool IsProviderScaffolding(string? rawReply)
@@ -790,7 +812,8 @@ public static class AiClient
         string systemPrompt,
         IReadOnlyList<ChatMessage> history,
         string userText,
-        string requiredSpeechLanguage)
+        string requiredSpeechLanguage,
+        bool strictRetry)
     {
         if (model.StartsWith("nvidia/nemotron-nano-9b-v2", StringComparison.OrdinalIgnoreCase))
             systemPrompt = "/no_think\n" + systemPrompt;
@@ -802,11 +825,17 @@ public static class AiClient
         {
             ["model"] = model,
             ["messages"] = messages,
-            ["temperature"] = 0.8,
+            ["temperature"] = strictRetry ? 0.2 : 0.45,
             ["max_tokens"] = 512,
         };
+        if (SupportsJsonObject(provider, model))
+            payload["response_format"] = new { type = "json_object" };
         if (provider == ProviderKind.OpenRouter)
             payload["reasoning"] = new { effort = "none", exclude = true };
+        if (provider == ProviderKind.OpenRouter &&
+            (model.Equals("openrouter/auto", StringComparison.OrdinalIgnoreCase) ||
+             model.Equals("openrouter/free", StringComparison.OrdinalIgnoreCase)))
+            payload["provider"] = new { require_parameters = true };
         if (provider == ProviderKind.OpenRouter &&
             model.Equals("openrouter/free", StringComparison.OrdinalIgnoreCase) &&
             !string.IsNullOrWhiteSpace(requiredSpeechLanguage))
@@ -848,11 +877,19 @@ public static class AiClient
         if (!string.IsNullOrWhiteSpace(apiKey))
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey.Trim());
         if (provider == ProviderKind.Gemini)
-            request.Headers.TryAddWithoutValidation("x-goog-api-client", "lilith-ai/0.7.3");
+            request.Headers.TryAddWithoutValidation("x-goog-api-client", "lilith-ai/0.13.0");
         if (provider == ProviderKind.OpenRouter)
             request.Headers.TryAddWithoutValidation("X-OpenRouter-Title", "Lilith AI");
         return request;
     }
+
+    private static bool SupportsJsonObject(ProviderKind provider, string model) => provider switch
+    {
+        ProviderKind.OpenAI or ProviderKind.Gemini or ProviderKind.XAI or ProviderKind.DeepSeek or ProviderKind.Mistral => true,
+        ProviderKind.OpenRouter => model.Equals("openrouter/auto", StringComparison.OrdinalIgnoreCase) ||
+                                   model.Equals("openrouter/free", StringComparison.OrdinalIgnoreCase),
+        _ => false,
+    };
 
     private static HttpRequestMessage BuildAnthropicRequest(
         string baseUrl,
@@ -895,7 +932,22 @@ public static class AiClient
         var choice = json.RootElement.GetProperty("choices")[0];
         finishReason = choice.TryGetProperty("finish_reason", out var reason) ? reason.GetString() : null;
         var content = choice.GetProperty("message").GetProperty("content");
-        return content.ValueKind == JsonValueKind.String ? content.GetString() : null;
+        if (content.ValueKind == JsonValueKind.String)
+            return content.GetString();
+        if (content.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var text = new StringBuilder();
+        foreach (var part in content.EnumerateArray())
+        {
+            if (part.ValueKind != JsonValueKind.Object || !part.TryGetProperty("text", out var value) ||
+                value.ValueKind != JsonValueKind.String)
+                continue;
+            if (text.Length > 0)
+                text.AppendLine();
+            text.Append(value.GetString());
+        }
+        return text.Length == 0 ? null : text.ToString();
     }
 
     private static string ReadAnthropicText(string body)

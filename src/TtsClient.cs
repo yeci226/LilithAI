@@ -25,13 +25,17 @@ public enum VoiceServiceStatus
 
 public static class RuntimeStage
 {
+    private static string LogMarker(string name) => $"__logged__:{name}";
+
     public static bool TryRunOptional(
         string name,
         Action action,
         ISet<string> disabledStages,
         Action<string> log)
     {
-        if (disabledStages.Contains(name))
+        // A transient Unity lifecycle error must not permanently remove a feature.
+        // Skip one invocation after a failure, then allow the stage to recover.
+        if (disabledStages.Remove(name))
             return false;
 
         try
@@ -41,8 +45,9 @@ public static class RuntimeStage
         }
         catch (Exception exception)
         {
-            if (disabledStages.Add(name))
-                log($"Optional runtime stage '{name}' disabled after failure; other stages continue: {exception}");
+            disabledStages.Add(name);
+            if (disabledStages.Add(LogMarker(name)))
+                log($"Optional runtime stage '{name}' failed and will retry after one skipped invocation; other stages continue: {exception}");
             return false;
         }
     }

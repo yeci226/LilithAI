@@ -5,6 +5,11 @@ using System.Text.Json;
 using LilithAI;
 
 AiReply.SelfTest();
+var legacyMessage = JsonSerializer.Deserialize<ChatMessage>("{\"Role\":\"assistant\",\"Content\":\"old line\"}");
+var sourcedMessage = JsonSerializer.Deserialize<ChatMessage>(JsonSerializer.Serialize(
+    new ChatMessage("assistant", "game line", ConversationSources.Game)));
+if (legacyMessage?.Source != string.Empty || sourcedMessage?.Source != ConversationSources.Game)
+    throw new InvalidOperationException("Conversation source compatibility self-test failed");
 var configTestDirectory = Path.Combine(Path.GetTempPath(), $"LilithAI-config-{Guid.NewGuid():N}");
 Directory.CreateDirectory(configTestDirectory);
 try
@@ -63,6 +68,27 @@ if (TtsClient.VoicePlaybackDelayFrames != 2 ||
     TtsClient.GetVoiceServiceStatus(VoiceMode.Japanese, true, true, true, true, true, false) != VoiceServiceStatus.Ready ||
     TtsClient.GetVoiceServiceStatus(VoiceMode.Chinese, true, true, false, false, false, false) != VoiceServiceStatus.ManualStart)
     throw new InvalidOperationException("TTS playback and warm-host policy self-test failed");
+var disabledStages = new HashSet<string>();
+var stageLogs = new List<string>();
+var brokenStageRuns = 0;
+var laterStageRan = false;
+if (RuntimeStage.TryRunOptional("broken", () =>
+    {
+        brokenStageRuns++;
+        throw new InvalidOperationException("expected smoke failure");
+    }, disabledStages, stageLogs.Add) ||
+    RuntimeStage.TryRunOptional("broken", () => brokenStageRuns++, disabledStages, stageLogs.Add) ||
+    !RuntimeStage.TryRunOptional("broken", () => brokenStageRuns++, disabledStages, stageLogs.Add) ||
+    !RuntimeStage.TryRunOptional("later", () => laterStageRan = true, disabledStages, stageLogs.Add) ||
+    brokenStageRuns != 2 || !laterStageRan || stageLogs.Count != 1 ||
+    !stageLogs[0].Contains("broken") || !stageLogs[0].Contains("will retry") || !stageLogs[0].Contains("other stages continue"))
+    throw new InvalidOperationException("Optional runtime stage isolation self-test failed");
+if (!ProactiveDialoguePolicy.ShouldQueue(true, true, true, false, 20, 19) ||
+    ProactiveDialoguePolicy.ShouldQueue(true, true, true, false, 20, 20) ||
+    ProactiveDialoguePolicy.ShouldQueue(true, false, true, false, 100, 0) ||
+    ProactiveDialoguePolicy.ShouldQueue(true, true, false, false, 100, 0) ||
+    ProactiveDialoguePolicy.ShouldQueue(true, true, true, true, 100, 0))
+    throw new InvalidOperationException("Proactive dialogue policy self-test failed");
 var translatedReply = new AiReply("English display", "None", "Chinese speech");
 var splitReply = TtsClient.SplitForSpeech(new AiReply("第一段\n\n第二段", "Greet", "一段目\n\n二段目"));
 var inlineReply = AiReply.Parse("first\n\uFF08\u52D5\u4F5C\uFF1ATiltHead\uFF09\nsecond\n(action: Stretch)");
@@ -92,9 +118,30 @@ if (clothingReply.Clothing != "Pajamas" || memoryReply.Memory != "玩家喜歡�
     !AiCommandProtocol.TryParseAlarm("2026-07-24T08:00:00", now, out var alarm) || alarm.Hour != 8 ||
     AiCommandProtocol.TryParseAlarm("2026-07-23T09:00:00", now, out _))
     throw new InvalidOperationException("Chat command protocol self-test failed");
+if (AiCommandProtocol.ResolveExplicitClothing("Tell me about pajamas", "Pajamas sound comfortable.", "Pajamas") != "None" ||
+    AiCommandProtocol.ResolveExplicitClothing("Please switch to casual clothes", "Sure, I will change into casual clothes.", "Casual") != "Casual" ||
+    AiCommandProtocol.ResolveCommand("Please set a timer for 25 minutes", "SetTimer") != "SetTimer" ||
+    AiCommandProtocol.ResolveCommand("I used a timer yesterday", "SetTimer") != "None" ||
+    AiCommandProtocol.ResolveCommand("Please sit down", "Sit") != "Sit" ||
+    AiCommandProtocol.ResolveCommand("You look sleepy", "Sleep") != "None")
+    throw new InvalidOperationException("Explicit AI action policy self-test failed");
+if (!AiReply.TryParseValidated("plain reply", out var plainReply) || plainReply.Text != "plain reply" ||
+    AiReply.TryParseValidated("{\"action\":\"Greet\"}", out _) ||
+    !AiClient.IsRetryableStatusCode(408) || !AiClient.IsRetryableStatusCode(429) || !AiClient.IsRetryableStatusCode(503) ||
+    AiClient.IsRetryableStatusCode(400) || AiClient.IsRetryableStatusCode(401))
+    throw new InvalidOperationException("AI response validation and retry policy self-test failed");
 if (TtsClient.SpokenLanguage(VoiceMode.Chinese) != "Chinese" ||
     TtsClient.SpokenLanguage(VoiceMode.Japanese) != "Japanese" ||
     TtsClient.SpokenLanguage(VoiceMode.Off) != string.Empty ||
+    TtsClient.RequiredSpeechLanguage(VoiceMode.Chinese, "zh-Hant") != string.Empty ||
+    TtsClient.RequiredSpeechLanguage(VoiceMode.Chinese, "zh-Hans") != string.Empty ||
+    TtsClient.RequiredSpeechLanguage(VoiceMode.Japanese, "ja") != string.Empty ||
+    TtsClient.RequiredSpeechLanguage(VoiceMode.Chinese, "en") != "Chinese" ||
+    TtsClient.RequiredSpeechLanguage(VoiceMode.Japanese, "en") != "Japanese" ||
+    TtsClient.RequiredSpeechLanguage(VoiceMode.Off, "en") != string.Empty ||
+    TtsClient.IsRetryableHttpStatus(400) ||
+    !TtsClient.IsRetryableHttpStatus(500) ||
+    TtsClient.IsRetryableHttpStatus(429) ||
     !TtsClient.ShouldRestartInterruptedPlayback(false, 2f, false) ||
     TtsClient.ShouldRestartInterruptedPlayback(true, 2f, false) ||
     TtsClient.ShouldRestartInterruptedPlayback(false, 0.05f, false) ||
@@ -109,10 +156,35 @@ if (TtsClient.SpokenLanguage(VoiceMode.Chinese) != "Chinese" ||
     TtsClient.SelectSpeech(VoiceMode.Chinese, translatedReply with { Speech = "" }, "en") != string.Empty ||
     TtsClient.DialogueDuration(3.6f) != 6f || TtsClient.DialogueDuration(8f) != 9f)
     throw new InvalidOperationException("Independent display and speech language self-test failed");
+var listener = new TcpListener(IPAddress.Loopback, 0);
+try
+{
+    listener.Start();
+    var endpoint = new Uri($"http://127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}/tts");
+    if (!TtsClient.IsLocalPortListening(endpoint))
+        throw new InvalidOperationException("TTS local port detection self-test failed");
+}
+finally
+{
+    listener.Stop();
+}
+if (!TtsClient.ShouldRestartLocalVoiceHost(VoiceMode.Chinese, true, false, VoiceMode.Chinese, 1, 5f, 5f) ||
+    TtsClient.ShouldRestartLocalVoiceHost(VoiceMode.Chinese, false, false, VoiceMode.Chinese, 1, 5f, 5f) ||
+    TtsClient.ShouldRestartLocalVoiceHost(VoiceMode.Chinese, true, true, VoiceMode.Chinese, 1, 5f, 5f) ||
+    TtsClient.ShouldRestartLocalVoiceHost(VoiceMode.Japanese, true, false, VoiceMode.Chinese, 1, 5f, 5f) ||
+    !TtsClient.ShouldRestartLocalVoiceHost(VoiceMode.Chinese, true, false, VoiceMode.Chinese, TtsClient.MaxVoiceHostRestartAttempts, 5f, 5f) ||
+    TtsClient.ShouldRestartLocalVoiceHost(VoiceMode.Chinese, true, false, VoiceMode.Chinese, TtsClient.MaxVoiceHostRestartAttempts + 1, 5f, 5f) ||
+    TtsClient.ShouldRestartLocalVoiceHost(VoiceMode.Chinese, true, false, VoiceMode.Chinese, 1, 4f, 5f) ||
+    TtsClient.VoiceHostRestartDelaySeconds(1) != 5f ||
+    TtsClient.VoiceHostRestartDelaySeconds(4) != 40f ||
+    TtsClient.VoiceHostRestartDelaySeconds(99) != 60f ||
+    TtsClient.GetVoiceServiceStatus(VoiceMode.Chinese, true, true, true, false, false, true, true) != VoiceServiceStatus.Retrying)
+    throw new InvalidOperationException("Voice host restart policy self-test failed");
 if (!ProviderProfiles.IsSelfHosted(ProviderKind.Ollama) || ProviderProfiles.IsSelfHosted(ProviderKind.OpenAI) ||
     ProviderProfiles.NeedsApiKey(ProviderKind.Ollama) || !ProviderProfiles.NeedsApiKey(ProviderKind.OpenAI) ||
     string.IsNullOrWhiteSpace(ProviderProfiles.DefaultModel(ProviderKind.OpenAI)) ||
-    ProviderProfiles.DefaultModel(ProviderKind.OpenRouter) != "nvidia/nemotron-nano-9b-v2:free" ||
+    ProviderProfiles.DefaultModel(ProviderKind.OpenRouter) != "openrouter/free" ||
+    !ProviderProfiles.Models(ProviderKind.OpenRouter).Contains(ProviderProfiles.LegacyOpenRouterDefaultModel) ||
     !ProviderProfiles.Models(ProviderKind.OpenRouter).Contains("openrouter/free") ||
     ProviderProfiles.LanguageCode("zh-TW") != "zh-Hant" || ProviderProfiles.LanguageCode("zh-CN") != "zh-Hans" ||
     ProviderProfiles.LanguageCode("ja-JP") != "ja" ||
@@ -144,12 +216,54 @@ catch (InvalidOperationException)
 if (!remoteTtsRejected)
     throw new InvalidOperationException("Remote TTS endpoint self-test failed");
 await Test(ProviderKind.OpenAI, "{\"choices\":[{\"message\":{\"content\":\"{\\\"text\\\":\\\"OpenAI OK\\\",\\\"action\\\":\\\"Greet\\\"}\"}}]}", "OpenAI OK");
+await Test(ProviderKind.OpenAI, "{\"choices\":[{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"array content OK\"}]}}]}", "array content OK");
 await Test(ProviderKind.Anthropic, "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"text\\\":\\\"Claude OK\\\",\\\"action\\\":\\\"Think\\\"}\"}]}", "Claude OK");
 await TestEmptyContentRetry();
+await TestProviderScaffoldingRetry();
 await TestMissingSpeechRetry();
 await TestAnthropicMissingSpeechFallback();
+await TestTransientStatusRetry();
+await TestSpeechHttpFailureKeepsText();
 await TestModels();
 Console.WriteLine("Lilith AI protocol smoke tests passed");
+
+static async Task TestTransientStatusRetry()
+{
+    var logs = new List<string>();
+    var progress = new List<AiRequestProgress>();
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    var server = ServeStatuses(listener,
+        (503, "{\"error\":\"temporary\"}"),
+        (200, "{\"choices\":[{\"message\":{\"content\":\"{\\\"text\\\":\\\"recovered after 503\\\",\\\"action\\\":\\\"None\\\"}\"}}]}"));
+    var reply = await AiClient.SendAsync(ProviderKind.OpenAI, $"http://127.0.0.1:{port}/v1", "test-key",
+        "test-model", "test prompt", Array.Empty<ChatMessage>(), "hello", 10, CancellationToken.None,
+        logs.Add, progress: progress.Add);
+    await server;
+    if (reply.Text != "recovered after 503" || logs.Count(log => log.StartsWith("AI REQUEST")) != 2 ||
+        !logs.Any(log => log.Contains("Temporary API status 503")) ||
+        !progress.Any(item => item.Stage == AiRequestStage.Retrying))
+        throw new InvalidOperationException("Transient AI status retry self-test failed");
+}
+
+static async Task TestSpeechHttpFailureKeepsText()
+{
+    var logs = new List<string>();
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    var server = ServeStatuses(listener,
+        (200, "{\"choices\":[{\"message\":{\"content\":\"{\\\"text\\\":\\\"display survives\\\",\\\"action\\\":\\\"None\\\"}\"}}]}"),
+        (400, "{\"error\":\"unsupported speech\"}"));
+    var reply = await AiClient.SendAsync(ProviderKind.OpenAI, $"http://127.0.0.1:{port}/v1", "test-key",
+        "test-model", "test prompt", Array.Empty<ChatMessage>(), "hello", 10, CancellationToken.None,
+        logs.Add, "Japanese");
+    await server;
+    if (reply.Text != "display survives" || !string.IsNullOrWhiteSpace(reply.Speech) ||
+        !logs.Any(log => log.Contains("text chat continues without TTS")))
+        throw new InvalidOperationException("Speech failure text fallback self-test failed");
+}
 
 static async Task TestModels()
 {
@@ -178,9 +292,40 @@ static async Task TestEmptyContentRetry()
     if (reply.Text != "retry OK" || logs.Count(log => log.StartsWith("AI REQUEST")) != 2 ||
         !logs.Any(log => log.StartsWith("AI RETRY")) ||
         !logs.Any(log => log.Contains("\"max_tokens\":512")) ||
+        !logs.Last(log => log.StartsWith("AI REQUEST")).Contains("\"temperature\":0.2") ||
         !logs.Any(log => log.Contains("\"content\":\"/no_think\\ntest prompt\"")) ||
         !logs.Any(log => log.Contains("\"reasoning\":{\"effort\":\"none\",\"exclude\":true}")))
         throw new InvalidOperationException("Empty response retry self-test failed");
+}
+
+static async Task TestProviderScaffoldingRetry()
+{
+    var logs = new List<string>();
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    var server = Serve(listener,
+        "{\"choices\":[{\"message\":{\"content\":\"vars: {\\\"memory\\\":\\\"\\\"}\"},\"finish_reason\":\"stop\"}]}",
+        "{\"choices\":[{\"message\":{\"content\":\"{\\\"text\\\":\\\"recovered\\\",\\\"action\\\":\\\"None\\\"}\"},\"finish_reason\":\"stop\"}]}");
+    var reply = await AiClient.SendAsync(ProviderKind.OpenRouter, $"http://127.0.0.1:{port}/v1", "test-key",
+        "nvidia/nemotron-nano-9b-v2:free", "test prompt", new[]
+        {
+            new ChatMessage("user", "vars: {\"memory\":\"keep user text\"}"),
+            new ChatMessage("assistant", "vars: {\"memory\":\"\"}"),
+        }, "hello", 10, CancellationToken.None, logs.Add);
+    await server;
+    var firstRequest = logs.First(log => log.StartsWith("AI REQUEST"));
+    var secondRequest = logs.Last(log => log.StartsWith("AI REQUEST"));
+    if (reply.Text != "recovered" || reply.Text.Contains("vars:", StringComparison.OrdinalIgnoreCase) ||
+        logs.Count(log => log.StartsWith("AI REQUEST")) != 2 ||
+        !logs.Any(log => log.Contains("scaffolding without user-facing content")) ||
+        logs.Any(log => log.Contains("Text: vars:")) ||
+        logs.Where(log => log.StartsWith("AI REQUEST"))
+            .Any(log => log.Contains("vars: {\\\"memory\\\":\\\"\\\"}")) ||
+        !firstRequest.Contains("keep user text") ||
+        !secondRequest.Contains("existing JSON response contract") ||
+        !secondRequest.Contains("non-empty user-facing text field"))
+        throw new InvalidOperationException("Provider scaffolding retry self-test failed");
 }
 
 static async Task TestMissingSpeechRetry()
@@ -248,15 +393,19 @@ static async Task Test(ProviderKind provider, string responseBody, string expect
     if (!logs.Any(log => log.StartsWith("AI REQUEST")) || !logs.Any(log => log.StartsWith("AI RESPONSE")) ||
         !logs.Any(log => log.StartsWith("AI PARSED")) || !logs.Any(log => log.Contains("Built-in game dialogue")) ||
         logs.Any(log => log.Contains("test-key")) ||
-        provider != ProviderKind.OpenRouter && logs.Any(log => log.Contains("\"reasoning\"")))
+        provider != ProviderKind.OpenRouter && logs.Any(log => log.Contains("\"reasoning\"")) ||
+        provider == ProviderKind.OpenAI && !logs.Any(log => log.Contains("\"response_format\":{\"type\":\"json_object\"}")))
         throw new InvalidOperationException("AI logging self-test failed");
 }
 
-static async Task Serve(TcpListener listener, params string[] responseBodies)
+static Task Serve(TcpListener listener, params string[] responseBodies) =>
+    ServeStatuses(listener, responseBodies.Select(body => (200, body)).ToArray());
+
+static async Task ServeStatuses(TcpListener listener, params (int Status, string Body)[] responses)
 {
     try
     {
-        foreach (var responseBody in responseBodies)
+        foreach (var response in responses)
         {
             using var client = await listener.AcceptTcpClientAsync();
             await using var stream = client.GetStream();
@@ -274,8 +423,9 @@ static async Task Serve(TcpListener listener, params string[] responseBodies)
                 await reader.ReadBlockAsync(body, 0, body.Length);
             }
 
-            var payload = Encoding.UTF8.GetBytes(responseBody);
-            var headers = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {payload.Length}\r\nConnection: close\r\n\r\n");
+            var payload = Encoding.UTF8.GetBytes(response.Body);
+            var reason = response.Status == 200 ? "OK" : response.Status == 400 ? "Bad Request" : "Service Unavailable";
+            var headers = Encoding.ASCII.GetBytes($"HTTP/1.1 {response.Status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {payload.Length}\r\nConnection: close\r\n\r\n");
             await stream.WriteAsync(headers);
             await stream.WriteAsync(payload);
         }

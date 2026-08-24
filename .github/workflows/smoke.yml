@@ -1,0 +1,17 @@
+name: smoke
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 6.0.x
+      - name: Run protocol and persistence smoke tests
+        run: dotnet run --project tests/LilithAISmoke.csproj -c Release

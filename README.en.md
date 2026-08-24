@@ -60,7 +60,8 @@ To update, close the game and overwrite the old files with the new ZIP. Your set
 - Your API key is stored only in `BepInEx/config/LilithAI.cfg`; the old settings file is renamed automatically on first launch.
 - Conversation history is stored in `BepInEx/data/LilithAI/memory.json`.
 - Important people, preferences, and events are stored in `long-term-memory.json`; both memory files keep a `.bak` and recover automatically if the main file is corrupt.
-- Proactive dialogue is enabled by default with a 30-minute minimum cooldown; configure it with `Companion.ProactiveDialogue` and `Companion.ProactiveCooldownMinutes`.
+- Proactive dialogue can react naturally to idle time, returning after an absence, Lilith state changes, and built-in game lines, with chance and cooldown limits. Configure it in the Lilith settings tab or with `Companion.ProactiveDialogue`, `Companion.ProactiveChancePercent`, and `Companion.ProactiveCooldownMinutes`.
+- Conversation memory distinguishes player input, AI replies, and built-in game dialogue; existing entries load as compatible legacy sources.
 - `BepInEx/LogOutput.log` may contain conversation text. Review it before sharing a bug report.
 - The player name is not sent by default. You can enable it with `Context.IncludePlayerName`.
 - Chinese speech uses GPT-SoVITS; Japanese speech uses [Irodori TTS Server](https://github.com/Aratako/Irodori-TTS-Server).

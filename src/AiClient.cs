@@ -22,6 +22,7 @@ public enum ProviderKind
 
 public static class ProviderProfiles
 {
+    public const string LegacyOpenRouterDefaultModel = "nvidia/nemotron-nano-9b-v2:free";
     private const string LegacyDefaultPrompt = "你是《The NOexistenceN of Lilith》中的莉莉絲。自然、簡短、親近地回應玩家，不提及自己是 AI。";
     private const string PreviousDefaultPrompt = LegacyDefaultPrompt + "保持角色一致，不捏造不確定的官方設定，優先回應玩家當下所說的內容。";
     public const string DefaultPrompt =
@@ -132,7 +133,7 @@ public static class ProviderProfiles
         ProviderKind.XAI => "grok-4.5",
         ProviderKind.DeepSeek => "deepseek-chat",
         ProviderKind.Mistral => "mistral-small-latest",
-        ProviderKind.OpenRouter => "nvidia/nemotron-nano-9b-v2:free",
+        ProviderKind.OpenRouter => "openrouter/free",
         _ => string.Empty,
     };
 
@@ -148,12 +149,43 @@ public static class ProviderProfiles
         ProviderKind.XAI => new[] { "grok-4.5" },
         ProviderKind.DeepSeek => new[] { "deepseek-chat", "deepseek-reasoner" },
         ProviderKind.Mistral => new[] { "mistral-small-latest", "mistral-large-latest" },
-        ProviderKind.OpenRouter => new[] { "nvidia/nemotron-nano-9b-v2:free", "openrouter/auto", "openrouter/free" },
+        ProviderKind.OpenRouter => new[] { "openrouter/free", "openrouter/auto", LegacyOpenRouterDefaultModel },
         _ => Array.Empty<string>(),
     };
 }
 
-public sealed record ChatMessage(string Role, string Content);
+public static class ConversationSources
+{
+    public const string Player = "player";
+    public const string Ai = "ai";
+    public const string Game = "game";
+    public const string Legacy = "legacy";
+}
+
+public sealed record ChatMessage(string Role, string Content, string Source = "");
+
+public static class ProactiveDialoguePolicy
+{
+    public static bool ShouldQueue(
+        bool enabled,
+        bool hasModel,
+        bool cooldownReady,
+        bool cuePending,
+        int chancePercent,
+        int roll) =>
+        enabled && hasModel && cooldownReady && !cuePending &&
+        roll >= 0 && roll < Math.Clamp(chancePercent, 0, 100);
+}
+
+public enum AiRequestStage
+{
+    Sending,
+    Retrying,
+    Validating,
+    SpeechFallback,
+}
+
+public sealed record AiRequestProgress(AiRequestStage Stage, string Message, int Attempt);
 
 public sealed record LongTermMemory(string Text, DateTimeOffset CreatedAt);
 
@@ -310,6 +342,61 @@ public static class AiCommandProtocol
         return requested != "None" && RequestedClothing(replyText) == requested ? requested : "None";
     }
 
+    public static string ResolveExplicitClothing(string userText, string replyText, string aiClothing)
+    {
+        var requested = RequestedClothing(userText);
+        if (requested == "None")
+            return "None";
+        return string.Equals(aiClothing, requested, StringComparison.OrdinalIgnoreCase) ||
+               RequestedClothing(replyText) == requested
+            ? requested
+            : "None";
+    }
+
+    public static string ResolveCommand(string userText, string aiCommand)
+    {
+        if (!Enum.TryParse<AiCommandType>(aiCommand, true, out var command) || command == AiCommandType.None)
+            return "None";
+        return IsExplicitCommandRequest(userText, command) ? command.ToString() : "None";
+    }
+
+    private static bool IsExplicitCommandRequest(string userText, AiCommandType command)
+    {
+        var text = (userText ?? string.Empty).Trim().ToLowerInvariant();
+        bool Has(params string[] values) => values.Any(text.Contains);
+        bool HasRequestVerb() => Has("please", "can you", "could you", "set ", "start ", "stop ", "play ",
+            "請", "请", "幫我", "帮我", "開始", "开始", "停止", "設定", "设置", "麻煩", "麻烦",
+            "して", "してくれ", "お願い", "始め", "止め", "セット");
+
+        return command switch
+        {
+            AiCommandType.SetTimer => Has("timer", "countdown", "計時器", "计时器", "倒數", "倒数", "タイマー") && HasRequestVerb(),
+            AiCommandType.CancelTimer => Has("timer", "countdown", "計時器", "计时器", "倒數", "倒数", "タイマー") &&
+                                         Has("cancel", "stop", "取消", "停止", "キャンセル", "止め"),
+            AiCommandType.SetAlarm => Has("alarm", "鬧鐘", "闹钟", "アラーム") && HasRequestVerb(),
+            AiCommandType.CancelAlarm => Has("alarm", "鬧鐘", "闹钟", "アラーム") &&
+                                         Has("cancel", "stop", "取消", "停止", "キャンセル", "止め"),
+            AiCommandType.StartPomodoro => Has("pomodoro", "番茄鐘", "番茄钟", "ポモドーロ") && HasRequestVerb(),
+            AiCommandType.StopPomodoro => Has("pomodoro", "番茄鐘", "番茄钟", "ポモドーロ") &&
+                                           Has("stop", "cancel", "停止", "取消", "止め", "キャンセル"),
+            AiCommandType.PlayMusic => Has("music", "song", "track", "音樂", "音乐", "歌曲", "音楽", "曲") &&
+                                       Has("play", "播放", "播", "放", "かけて", "再生"),
+            AiCommandType.NextMusic => Has("next song", "next track", "下一首", "下一曲", "次の曲"),
+            AiCommandType.StopMusic => Has("music", "song", "track", "音樂", "音乐", "歌曲", "音楽", "曲") &&
+                                       Has("stop", "pause", "停止", "暫停", "暂停", "止め", "一時停止"),
+            AiCommandType.SetGlasses => Has("glasses", "sunglasses", "眼鏡", "眼镜", "墨鏡", "墨镜", "メガネ", "サングラス") && HasRequestVerb(),
+            AiCommandType.SetHat => Has("hat", "帽子", "ぼうし") && HasRequestVerb(),
+            AiCommandType.Quiet => Has("be quiet", "quiet please", "安靜", "安静", "別說話", "别说话", "静かに"),
+            AiCommandType.Recall => Has("come back", "return here", "回來", "回来", "回到我", "戻って", "帰って"),
+            AiCommandType.Sit => Has("sit down", "坐下", "坐好", "座って"),
+            AiCommandType.LieDown => Has("lie down", "躺下", "躺好", "横になって"),
+            AiCommandType.Sleep => Has("go to sleep", "睡覺", "睡觉", "去睡", "寝て"),
+            AiCommandType.Wake => Has("wake up", "起床", "醒醒", "起きて"),
+            AiCommandType.Stand => Has("stand up", "站起", "起立", "立って"),
+            _ => false,
+        };
+    }
+
     private static string RequestedClothing(string text)
     {
         var request = (text ?? string.Empty).Trim().ToLowerInvariant();
@@ -389,6 +476,34 @@ public sealed record AiReply(
         return new AiReply(cleaned, action) { InlineActions = actions };
     }
 
+    public static bool TryParseValidated(string? raw, out AiReply reply)
+    {
+        reply = Parse(raw ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(reply.Text))
+            return false;
+
+        var trimmed = (raw ?? string.Empty).TrimStart();
+        var looksStructured = trimmed.StartsWith("{", StringComparison.Ordinal) ||
+                              trimmed.StartsWith("```json", StringComparison.OrdinalIgnoreCase);
+        if (!looksStructured)
+            return true;
+
+        var start = trimmed.IndexOf('{');
+        var end = trimmed.LastIndexOf('}');
+        if (start < 0 || end <= start)
+            return false;
+
+        try
+        {
+            var parsed = JsonSerializer.Deserialize<AiReply>(trimmed[start..(end + 1)], JsonOptions);
+            return !string.IsNullOrWhiteSpace(parsed?.Text);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
     private static string StripInlineActions(string? text, out string action, out string[] actions)
     {
         var input = text ?? string.Empty;
@@ -455,7 +570,8 @@ public static class AiClient
         int timeoutSeconds,
         CancellationToken lifetime,
         Action<string>? log = null,
-        string requiredSpeechLanguage = "")
+        string requiredSpeechLanguage = "",
+        Action<AiRequestProgress>? progress = null)
     {
         if (string.IsNullOrWhiteSpace(baseUrl))
             throw new InvalidOperationException("Base URL is empty");
@@ -464,33 +580,111 @@ public static class AiClient
         timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
         AiReply? replyNeedingSpeech = null;
+        var scaffoldingRetry = false;
         for (var attempt = 0; attempt < 3; attempt++)
         {
             var speechFallback = replyNeedingSpeech != null;
+            progress?.Invoke(new AiRequestProgress(
+                speechFallback ? AiRequestStage.SpeechFallback : attempt == 0 ? AiRequestStage.Sending : AiRequestStage.Retrying,
+                speechFallback ? $"Preparing {requiredSpeechLanguage} speech" : attempt == 0 ? "Sending request" : "Retrying response",
+                attempt + 1));
             var prompt = speechFallback
                 ? $"Your previous response omitted speech. Translate the user's text into natural spoken {requiredSpeechLanguage}. Return only the translation, without JSON, labels, or explanation."
+                : scaffoldingRetry
+                    ? $"{systemPrompt}\nThe previous response was empty, malformed, or provider scaffolding. Follow the existing JSON response contract exactly and include a non-empty user-facing text field; do not return vars or metadata."
                 : systemPrompt;
-            var requestHistory = speechFallback ? Array.Empty<ChatMessage>() : history;
+            var requestHistory = speechFallback
+                ? Array.Empty<ChatMessage>()
+                : history.Where(message =>
+                    !string.Equals(message.Role, "assistant", StringComparison.OrdinalIgnoreCase) ||
+                    !IsProviderScaffolding(message.Content)).ToArray();
             var requestText = speechFallback ? replyNeedingSpeech!.Text : userText;
             using var request = provider == ProviderKind.Anthropic
                 ? BuildAnthropicRequest(baseUrl, apiKey, model, prompt, requestHistory, requestText)
                 : BuildOpenAiRequest(provider, baseUrl, apiKey, model, prompt, requestHistory, requestText,
-                    speechFallback ? string.Empty : requiredSpeechLanguage);
+                    speechFallback ? string.Empty : requiredSpeechLanguage, scaffoldingRetry);
             var requestBody = await request.Content!.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
-            log?.Invoke($"AI REQUEST\nMode: {(speechFallback ? "Speech fallback" : "Reply")}\nProvider: {provider}\nModel: {model}\nEndpoint: {request.RequestUri}\nPayload:\n{requestBody}");
-            using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
+            log?.Invoke($"AI REQUEST\nMode: {(speechFallback ? "Speech fallback" : "Reply")}\nAttempt: {attempt + 1}\nProvider: {provider}\nModel: {model}\nEndpoint: {request.RequestUri}\nPayload:\n{requestBody}");
+            HttpResponseMessage response;
+            try
+            {
+                response = await Http.SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
+            }
+            catch (HttpRequestException exception) when (speechFallback)
+            {
+                log?.Invoke($"AI SPEECH FALLBACK\nSpeech connection failed ({exception.GetType().Name}); text chat continues without TTS.");
+                return replyNeedingSpeech!;
+            }
+            catch (OperationCanceledException) when (speechFallback && !lifetime.IsCancellationRequested)
+            {
+                log?.Invoke("AI SPEECH FALLBACK\nSpeech request timed out; text chat continues without TTS.");
+                return replyNeedingSpeech!;
+            }
+            catch (HttpRequestException exception) when (attempt == 0)
+            {
+                log?.Invoke($"AI RETRY\nTemporary connection failure ({exception.GetType().Name}); retrying once.");
+                progress?.Invoke(new AiRequestProgress(AiRequestStage.Retrying, "Connection interrupted; retrying", attempt + 2));
+                await Task.Delay(250, timeout.Token).ConfigureAwait(false);
+                continue;
+            }
+            using var responseLifetime = response;
             var body = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
             var responseLog = speechFallback ? "AI SPEECH RESPONSE" : "AI RESPONSE";
-            log?.Invoke($"{responseLog}\nStatus: {(int)response.StatusCode} {response.ReasonPhrase}\nBody:\n{body}");
+            log?.Invoke($"{responseLog}\nStatus: {(int)response.StatusCode} {response.ReasonPhrase}\nBody: omitted from log to keep private response fields out of diagnostics");
 
             if (!response.IsSuccessStatusCode)
-                throw new InvalidOperationException($"API {(int)response.StatusCode}: {Trim(body, 240)}");
+            {
+                if (speechFallback)
+                {
+                    log?.Invoke($"AI SPEECH FALLBACK\nSpeech request failed with HTTP {(int)response.StatusCode}; text chat continues without TTS.");
+                    return replyNeedingSpeech!;
+                }
+                if (attempt == 0 && IsRetryableStatusCode((int)response.StatusCode))
+                {
+                    log?.Invoke($"AI RETRY\nTemporary API status {(int)response.StatusCode}; retrying once.");
+                    progress?.Invoke(new AiRequestProgress(AiRequestStage.Retrying, "Provider temporarily unavailable; retrying", attempt + 2));
+                    await Task.Delay(RetryDelay(response), timeout.Token).ConfigureAwait(false);
+                    continue;
+                }
+                throw new InvalidOperationException($"API {(int)response.StatusCode}: provider request failed");
+            }
 
             string? finishReason = null;
-            var rawReply = provider == ProviderKind.Anthropic
-                ? ReadAnthropicText(body)
-                : ReadOpenAiText(body, out finishReason);
-            if (string.IsNullOrWhiteSpace(rawReply))
+            string? rawReply;
+            try
+            {
+                rawReply = provider == ProviderKind.Anthropic
+                    ? ReadAnthropicText(body)
+                    : ReadOpenAiText(body, out finishReason);
+            }
+            catch (Exception exception) when (speechFallback && IsResponseShapeException(exception))
+            {
+                log?.Invoke("AI SPEECH FALLBACK\nProvider returned malformed speech data; text chat continues without TTS.");
+                return replyNeedingSpeech!;
+            }
+            catch (Exception exception) when (attempt == 0 && IsResponseShapeException(exception))
+            {
+                scaffoldingRetry = true;
+                log?.Invoke($"AI RETRY\nProvider returned malformed response data ({exception.GetType().Name}); retrying once.");
+                continue;
+            }
+            progress?.Invoke(new AiRequestProgress(AiRequestStage.Validating, "Validating response", attempt + 1));
+            if (IsProviderScaffolding(rawReply))
+            {
+                if (speechFallback)
+                {
+                    log?.Invoke("AI SPEECH FALLBACK\nProvider returned scaffolding instead of speech; text chat continues without TTS.");
+                    return replyNeedingSpeech!;
+                }
+                if (attempt == 0)
+                {
+                    scaffoldingRetry = true;
+                    log?.Invoke("AI RETRY\nProvider returned scaffolding without user-facing content; retrying once.");
+                    continue;
+                }
+                throw new InvalidOperationException("API returned provider scaffolding without user-facing content");
+            }
+            if (!AiReply.TryParseValidated(rawReply, out var validatedReply))
             {
                 if (speechFallback)
                 {
@@ -499,17 +693,18 @@ public static class AiClient
                 }
                 if (attempt == 0)
                 {
-                    log?.Invoke($"AI RETRY\nProvider returned no answer content (finish_reason: {finishReason ?? "unknown"}); retrying once.");
+                    scaffoldingRetry = true;
+                    log?.Invoke($"AI RETRY\nProvider returned empty or malformed content (finish_reason: {finishReason ?? "unknown"}); retrying once.");
                     continue;
                 }
                 throw new InvalidOperationException(finishReason == "length"
                     ? "AI 回覆被截斷，請改用其他模型。"
-                    : "API returned an empty response");
+                    : "API returned an empty or malformed response");
             }
 
             if (speechFallback)
             {
-                var translated = AiReply.Parse(rawReply);
+                var translated = validatedReply;
                 var speech = string.IsNullOrWhiteSpace(translated.Speech) ? translated.Text : translated.Speech;
                 if (string.IsNullOrWhiteSpace(speech))
                 {
@@ -521,7 +716,7 @@ public static class AiClient
                 return result;
             }
 
-            var reply = AiReply.Parse(rawReply);
+            var reply = validatedReply;
             log?.Invoke($"AI PARSED\nText: {reply.Text}\nSpeech: {reply.Speech}\nAction: {reply.Action}\nClothing: {reply.Clothing}\nCommand: {reply.Command}\nArgument: {reply.Argument}\nMemory: {reply.Memory}");
             if (!string.IsNullOrWhiteSpace(requiredSpeechLanguage) && string.IsNullOrWhiteSpace(reply.Speech))
             {
@@ -533,6 +728,51 @@ public static class AiClient
         }
 
         throw new InvalidOperationException("AI request failed");
+    }
+
+    public static bool IsRetryableStatusCode(int statusCode) =>
+        statusCode is 408 or 425 or 429 || statusCode is >= 500 and <= 599;
+
+    private static bool IsResponseShapeException(Exception exception) =>
+        exception is JsonException or KeyNotFoundException or InvalidOperationException;
+
+    private static TimeSpan RetryDelay(HttpResponseMessage response)
+    {
+        var seconds = response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 0.25;
+        return TimeSpan.FromSeconds(Math.Clamp(seconds, 0.1, 30));
+    }
+
+    private static bool IsProviderScaffolding(string? rawReply)
+    {
+        if (string.IsNullOrWhiteSpace(rawReply))
+            return false;
+
+        var trimmed = rawReply.Trim();
+        const string prefix = "vars:";
+        if (!trimmed.StartsWith(prefix, StringComparison.Ordinal) ||
+            trimmed.Length == prefix.Length)
+            return false;
+
+        try
+        {
+            using var document = JsonDocument.Parse(trimmed[prefix.Length..].Trim());
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                return false;
+
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if ((property.Name.Equals("text", StringComparison.OrdinalIgnoreCase) ||
+                     property.Name.Equals("speech", StringComparison.OrdinalIgnoreCase)) &&
+                    property.Value.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(property.Value.GetString()))
+                    return false;
+            }
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     public static async Task<string[]> ListModelsAsync(
@@ -572,7 +812,8 @@ public static class AiClient
         string systemPrompt,
         IReadOnlyList<ChatMessage> history,
         string userText,
-        string requiredSpeechLanguage)
+        string requiredSpeechLanguage,
+        bool strictRetry)
     {
         if (model.StartsWith("nvidia/nemotron-nano-9b-v2", StringComparison.OrdinalIgnoreCase))
             systemPrompt = "/no_think\n" + systemPrompt;
@@ -584,11 +825,17 @@ public static class AiClient
         {
             ["model"] = model,
             ["messages"] = messages,
-            ["temperature"] = 0.8,
+            ["temperature"] = strictRetry ? 0.2 : 0.45,
             ["max_tokens"] = 512,
         };
+        if (SupportsJsonObject(provider, model))
+            payload["response_format"] = new { type = "json_object" };
         if (provider == ProviderKind.OpenRouter)
             payload["reasoning"] = new { effort = "none", exclude = true };
+        if (provider == ProviderKind.OpenRouter &&
+            (model.Equals("openrouter/auto", StringComparison.OrdinalIgnoreCase) ||
+             model.Equals("openrouter/free", StringComparison.OrdinalIgnoreCase)))
+            payload["provider"] = new { require_parameters = true };
         if (provider == ProviderKind.OpenRouter &&
             model.Equals("openrouter/free", StringComparison.OrdinalIgnoreCase) &&
             !string.IsNullOrWhiteSpace(requiredSpeechLanguage))
@@ -630,11 +877,19 @@ public static class AiClient
         if (!string.IsNullOrWhiteSpace(apiKey))
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey.Trim());
         if (provider == ProviderKind.Gemini)
-            request.Headers.TryAddWithoutValidation("x-goog-api-client", "lilith-ai/0.7.3");
+            request.Headers.TryAddWithoutValidation("x-goog-api-client", "lilith-ai/0.13.0");
         if (provider == ProviderKind.OpenRouter)
             request.Headers.TryAddWithoutValidation("X-OpenRouter-Title", "Lilith AI");
         return request;
     }
+
+    private static bool SupportsJsonObject(ProviderKind provider, string model) => provider switch
+    {
+        ProviderKind.OpenAI or ProviderKind.Gemini or ProviderKind.XAI or ProviderKind.DeepSeek or ProviderKind.Mistral => true,
+        ProviderKind.OpenRouter => model.Equals("openrouter/auto", StringComparison.OrdinalIgnoreCase) ||
+                                   model.Equals("openrouter/free", StringComparison.OrdinalIgnoreCase),
+        _ => false,
+    };
 
     private static HttpRequestMessage BuildAnthropicRequest(
         string baseUrl,
@@ -677,7 +932,22 @@ public static class AiClient
         var choice = json.RootElement.GetProperty("choices")[0];
         finishReason = choice.TryGetProperty("finish_reason", out var reason) ? reason.GetString() : null;
         var content = choice.GetProperty("message").GetProperty("content");
-        return content.ValueKind == JsonValueKind.String ? content.GetString() : null;
+        if (content.ValueKind == JsonValueKind.String)
+            return content.GetString();
+        if (content.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var text = new StringBuilder();
+        foreach (var part in content.EnumerateArray())
+        {
+            if (part.ValueKind != JsonValueKind.Object || !part.TryGetProperty("text", out var value) ||
+                value.ValueKind != JsonValueKind.String)
+                continue;
+            if (text.Length > 0)
+                text.AppendLine();
+            text.Append(value.GetString());
+        }
+        return text.Length == 0 ? null : text.ToString();
     }
 
     private static string ReadAnthropicText(string body)

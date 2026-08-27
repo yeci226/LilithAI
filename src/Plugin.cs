@@ -6,16 +6,18 @@ using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.Attributes;
 using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Text;
 using TMPro;
 using UI.Common;
 using UI.TraySettingNew;
 using UI.TraySettingNew.SettingItems;
+using UI.TraySettingNew.SpecialItems;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.Events;
 using UnityEngine.UI;
 using System.Text.Json;
-using ToggleOption = Il2CppSystem.ValueTuple<string, string, int>;
 
 namespace LilithAI;
 
@@ -164,7 +166,6 @@ public sealed class Controller : MonoBehaviour
     private const int MaxDialogueDisplayAttempts = 12;
     // Runtime diagnostic confirmed Root children: deco, title, input, confirm, refuse.
     private const int NativeNamingTitleChildIndex = 1;
-    private const int NativeNamingCancelChildIndex = 4;
 
     internal static Controller? Instance { get; private set; }
 
@@ -212,12 +213,12 @@ public sealed class Controller : MonoBehaviour
     private readonly ConcurrentQueue<AiRequestProgress> _requestProgress = new();
     private bool _requestIsProactive;
     private string _requestUserText = string.Empty;
+    private string _requestLanguage = "en";
     private float _nextProactiveAt;
     private string _proactiveTrigger = string.Empty;
     private string _proactiveDetail = string.Empty;
     private float _proactiveDueAt;
     private string _lastProactiveSkipReason = string.Empty;
-    private float _lastProactiveSkipLoggedAt = -10f;
     private bool _wasApplicationFocused = true;
     private float _applicationFocusLostAt = -1f;
     private string _lastLilithState = string.Empty;
@@ -243,25 +244,42 @@ public sealed class Controller : MonoBehaviour
     private string _lastGameLanguage = string.Empty;
     private TraySettingNewView? _settingsView;
     private GameObject? _trayCustomRoot;
+    private GameObject? _trayVoiceRoot;
     private RectTransform? _trayContent;
     private RectTransform? _trayViewport;
-    private ScrollRect? _trayScrollRect;
+    private RectTransform? _trayGeometryContent;
+    private Vector2 _trayOriginalAnchorMin;
+    private Vector2 _trayOriginalAnchorMax;
+    private Vector2 _trayOriginalPivot;
+    private Vector2 _trayOriginalAnchoredPosition;
+    private Vector2 _trayOriginalSizeDelta;
+    private float _trayOriginalHeight;
+    private float _trayTopInset;
+    private float _trayBottomInset;
+    private RectMask2D? _trayAddedMask;
+    private float _trayContentTop;
+    private float _trayScrollOffset;
+    private int _trayWheelDelta;
+    private IntPtr _trayWindowHandle;
+    private IntPtr _previousWindowProc;
+    private IntPtr _trayWindowProcPointer;
+    private WindowProc? _trayWindowProc;
+    private bool _trayWheelLogged;
+    private PointerEventData? _trayWheelEventData;
     private RectTransform? _trayAiContent;
-    private float _trayAiNativeContentHeight;
+    private RectTransform? _trayVoiceContent;
     private bool _trayScrollReady;
     private bool _trayScrollLogged;
     private TMP_InputField? _trayBaseUrlInput;
     private TMP_InputField? _trayApiKeyInput;
     private TMP_InputField? _trayPromptInput;
-    private TMP_Text? _trayHeaderLabel;
-    private SettingToggleItem? _trayProviderToggle;
-    private SettingToggleItem? _trayModelToggle;
-    private SettingSwitchItems? _trayProactiveToggle;
-    private SettingToggleItem? _trayProactiveChanceToggle;
-    private SettingToggleItem? _trayProactiveCooldownToggle;
-    private TMP_Text? _trayVoiceHeaderLabel;
-    private SettingToggleItem? _trayVoiceToggle;
-    private SettingSwitchItems? _trayVoiceRestartToggle;
+    private NativeSelectorBinding? _trayProviderSelector;
+    private NativeSelectorBinding? _trayModelSelector;
+    private NativeSwitchBinding? _trayProactiveSwitch;
+    private NativeSelectorBinding? _trayProactiveChanceSelector;
+    private NativeSelectorBinding? _trayProactiveCooldownSelector;
+    private NativeSelectorBinding? _trayVoiceSelector;
+    private NativeSwitchBinding? _trayVoiceRestartSwitch;
     private CharacterInteractionHandler? _interactionHandler;
     private PlayerLineController? _playerLineMenu;
     private Button? _aiMenuButton;
@@ -270,7 +288,6 @@ public sealed class Controller : MonoBehaviour
     private TMP_Text? _chatTitle;
     private Button? _chatSendButton;
     private Button? _chatCancelButton;
-    private UnityAction? _headerAction;
     private Il2CppSystem.Action? _doubleClickAction;
     private UnityAction<string>? _focusGameWindowAction;
     private UnityAction<string>? _endKeyboardInputAction;
@@ -320,6 +337,206 @@ public sealed class Controller : MonoBehaviour
     private readonly HashSet<int> _diagnosedSettingsViews = new();
     private readonly HashSet<int> _diagnosedNamingViews = new();
     private readonly HashSet<int> _diagnosedPlayerLineMenus = new();
+    private readonly List<NativeSelectorBinding> _traySelectors = new();
+    private readonly List<NativeSwitchBinding> _traySwitches = new();
+    private readonly List<NativeInputBinding> _trayInputs = new();
+
+    private sealed class NativeSelectorBinding : IDisposable
+    {
+        private readonly Button _previousButton;
+        private readonly Button _nextButton;
+        private readonly UnityAction _previousAction;
+        private readonly UnityAction _nextAction;
+        private readonly Action<int> _changed;
+        private readonly Func<int, string>? _displayValue;
+        private readonly Func<bool>? _canInteractWhenSingleOption;
+        private string[] _options = Array.Empty<string>();
+        private int _index;
+
+        public NativeSelectorBinding(
+            GameObject row,
+            TMP_Text title,
+            TMP_Text value,
+            Button previousButton,
+            Button nextButton,
+            Action<int> changed,
+            Func<int, string>? displayValue = null,
+            Func<bool>? canInteractWhenSingleOption = null)
+        {
+            Row = row;
+            Title = title;
+            Value = value;
+            _previousButton = previousButton;
+            _nextButton = nextButton;
+            _changed = changed;
+            _displayValue = displayValue;
+            _canInteractWhenSingleOption = canInteractWhenSingleOption;
+            _previousAction = DelegateSupport.ConvertDelegate<UnityAction>(new Action(SelectPrevious)) ??
+                              throw new InvalidOperationException("Could not bind native selector previous listener");
+            _nextAction = DelegateSupport.ConvertDelegate<UnityAction>(new Action(SelectNext)) ??
+                          throw new InvalidOperationException("Could not bind native selector next listener");
+            _previousButton.onClick.AddListener(_previousAction);
+            _nextButton.onClick.AddListener(_nextAction);
+            Value.enableAutoSizing = true;
+            Value.fontSizeMin = 8f;
+            Value.enableWordWrapping = false;
+            Value.overflowMode = TextOverflowModes.Ellipsis;
+        }
+
+        public GameObject Row { get; }
+        public TMP_Text Title { get; }
+        public TMP_Text Value { get; }
+        public int Index => _index;
+
+        public void SetOptions(string[] options, int selectedIndex)
+        {
+            _options = options.Length == 0 ? new[] { "—" } : options;
+            _index = Math.Clamp(selectedIndex, 0, _options.Length - 1);
+            Refresh(false);
+        }
+
+        public void SetTitle(string text) => Controller.SetLabel(Title, text);
+
+        private void SelectPrevious()
+        {
+            if (_options.Length == 0)
+                return;
+            _index = (_index + _options.Length - 1) % _options.Length;
+            Refresh(true);
+        }
+
+        private void SelectNext()
+        {
+            if (_options.Length == 0)
+                return;
+            _index = (_index + 1) % _options.Length;
+            Refresh(true);
+        }
+
+        private void Refresh(bool notify)
+        {
+            var text = _displayValue?.Invoke(_index) ?? _options[_index];
+            Controller.SetLabel(Value, text);
+            var canChange = _options.Length > 1 || (_options.Length == 1 && _canInteractWhenSingleOption?.Invoke() == true);
+            _previousButton.interactable = canChange;
+            _nextButton.interactable = canChange;
+            if (notify)
+                _changed(_index);
+        }
+
+        public void Dispose()
+        {
+            _previousButton.onClick.RemoveListener(_previousAction);
+            _nextButton.onClick.RemoveListener(_nextAction);
+        }
+    }
+
+    private sealed class NativeSwitchBinding : IDisposable
+    {
+        private readonly Button _onButton;
+        private readonly Button _offButton;
+        private readonly UnityAction _toggleAction;
+        private readonly Action<bool> _changed;
+        private bool _value;
+
+        public NativeSwitchBinding(
+            GameObject row,
+            TMP_Text title,
+            Button onButton,
+            Button offButton,
+            bool value,
+            Action<bool> changed)
+        {
+            Row = row;
+            Title = title;
+            _onButton = onButton;
+            _offButton = offButton;
+            _changed = changed;
+            _toggleAction = DelegateSupport.ConvertDelegate<UnityAction>(new Action(Toggle)) ??
+                            throw new InvalidOperationException("Could not bind native switch listener");
+            _onButton.onClick.AddListener(_toggleAction);
+            _offButton.onClick.AddListener(_toggleAction);
+            SetValue(value, false);
+        }
+
+        public GameObject Row { get; }
+        public TMP_Text Title { get; }
+
+        public void SetTitle(string text) => Controller.SetLabel(Title, text);
+
+        public void SetValue(bool value, bool notify)
+        {
+            var changed = _value != value;
+            _value = value;
+            _onButton.gameObject.SetActive(_value);
+            _offButton.gameObject.SetActive(!_value);
+            if (notify && changed)
+                _changed(_value);
+        }
+
+        private void Toggle() => SetValue(!_value, true);
+
+        public void Dispose()
+        {
+            _onButton.onClick.RemoveListener(_toggleAction);
+            _offButton.onClick.RemoveListener(_toggleAction);
+        }
+    }
+
+    private sealed class NativeInputBinding : IDisposable
+    {
+        private readonly TMP_InputField _input;
+        private readonly Button? _editButton;
+        private readonly UnityAction? _editAction;
+        private readonly UnityAction<string> _focusAction;
+        private readonly UnityAction<string> _endAction;
+        private readonly UnityAction<string> _saveAction;
+
+        public NativeInputBinding(
+            GameObject row,
+            TMP_InputField input,
+            Button? editButton,
+            UnityAction<string> focusAction,
+            UnityAction<string> endAction,
+            UnityAction<string> saveAction)
+        {
+            Row = row;
+            _input = input;
+            _editButton = editButton;
+            _focusAction = focusAction;
+            _endAction = endAction;
+            _saveAction = saveAction;
+            _input.onSelect.AddListener(_focusAction);
+            _input.onDeselect.AddListener(_endAction);
+            _input.onEndEdit.AddListener(_saveAction);
+            if (_editButton != null)
+            {
+                _editAction = DelegateSupport.ConvertDelegate<UnityAction>(new Action(BeginEdit)) ??
+                              throw new InvalidOperationException("Could not bind native input edit listener");
+                _editButton.onClick.AddListener(_editAction);
+            }
+        }
+
+        public GameObject Row { get; }
+
+        public void SetText(string text) => _input.SetTextWithoutNotify(text);
+
+        private void BeginEdit()
+        {
+            Controller.FocusGameWindow(string.Empty);
+            _input.Select();
+            _input.ActivateInputField();
+        }
+
+        public void Dispose()
+        {
+            _input.onSelect.RemoveListener(_focusAction);
+            _input.onDeselect.RemoveListener(_endAction);
+            _input.onEndEdit.RemoveListener(_saveAction);
+            if (_editButton != null && _editAction != null)
+                _editButton.onClick.RemoveListener(_editAction);
+        }
+    }
 
     [HideFromIl2Cpp]
     public void Initialize(ModSettings settings)
@@ -365,6 +582,8 @@ public sealed class Controller : MonoBehaviour
         RunOptionalStage(nameof(EnsureGameDialogueMemory), EnsureGameDialogueMemory);
         RunOptionalStage(nameof(SelectAiTabWhenOpened), SelectAiTabWhenOpened);
         RunOptionalStage(nameof(RefreshProviderRowsWhenTabChanges), RefreshProviderRowsWhenTabChanges);
+        RunOptionalStage(nameof(EnsureTrayWheelHook), EnsureTrayWheelHook);
+        RunOptionalStage(nameof(ProcessTrayWheel), ProcessTrayWheel);
 
         if (Time.frameCount - _lastSettingsScanFrame > 120)
         {
@@ -397,7 +616,9 @@ public sealed class Controller : MonoBehaviour
 
     private void OnDestroy()
     {
+        RestoreTrayWheelHook();
         SyncTraySettings();
+        DisposeTraySettings();
         StopThinking();
         RemoveChatMenuButton();
         DetachGameDialogueMemory();
@@ -460,35 +681,45 @@ public sealed class Controller : MonoBehaviour
         _requestLifetime?.Dispose();
         _requestLifetime = CancellationTokenSource.CreateLinkedTokenSource(_lifetime!.Token);
         _requestCancelledByUser = false;
+        _requestLanguage = ProviderProfiles.LanguageCode(GameSetting.Language);
         Plugin.LogSource.LogInfo($"AI request started: mode={(proactive ? "proactive" : "player")}, provider={_provider}, model={_model}");
         _request = AiClient.SendAsync(
             _provider,
             _baseUrl,
             _apiKey,
             _model,
-            BuildSystemPrompt(memoryQuery),
-            HistoryForModel(),
+            BuildSystemPrompt(memoryQuery, _requestLanguage),
+            HistoryForModel(_requestLanguage),
             userText,
             _settings.TimeoutSeconds,
             _requestLifetime.Token,
             message => Plugin.LogSource.LogInfo(message),
             TtsClient.RequiredSpeechLanguage(_voiceMode, ProviderProfiles.LanguageCode(GameSetting.Language)),
-            progress => _requestProgress.Enqueue(progress));
+            EnqueueRequestProgress);
     }
 
     [HideFromIl2Cpp]
-    private ChatMessage[] HistoryForModel() => _history
+    private void EnqueueRequestProgress(AiRequestProgress progress) => _requestProgress.Enqueue(progress);
+
+    [HideFromIl2Cpp]
+    private ChatMessage[] HistoryForModel(string language) => _history
         .TakeLast(_settings.MemoryTurns * 2)
-        .Select(message => message.Source == ConversationSources.Game
-            ? new ChatMessage("assistant", $"[Game dialogue context] {message.Content}", message.Source)
-            : message)
+        .Select(message =>
+        {
+            var content = message.Source is ConversationSources.Ai or ConversationSources.Game
+                ? DisplayLanguage.NormalizeChinese(message.Content, language)
+                : message.Content;
+            return message.Source == ConversationSources.Game
+                ? new ChatMessage("assistant", $"[Game dialogue context] {content}", message.Source)
+                : message with { Content = content };
+        })
         .ToArray();
 
     [HideFromIl2Cpp]
-    private string BuildSystemPrompt(string memoryQuery)
+    private string BuildSystemPrompt(string memoryQuery, string? languageOverride = null)
     {
         var actions = string.Join(", ", AllowedActions.Select(action => action.ToString()));
-        var language = GameSetting.Language;
+        var language = languageOverride ?? GameSetting.Language;
         var prompt = _usesDefaultPrompt ? ProviderProfiles.CharacterPrompt(language) : _prompt;
         var now = DateTimeOffset.Now;
         var player = string.Empty;
@@ -704,18 +935,18 @@ public sealed class Controller : MonoBehaviour
     private void TryStartProactiveDialogue()
     {
         var manager = DialogueManager.instance;
+        var queued = !string.IsNullOrEmpty(_proactiveTrigger);
+        if (queued && Time.unscaledTime < _proactiveDueAt)
+            return;
+        if (!queued && Time.unscaledTime < _nextProactiveAt)
+            return;
+
         var skipReason = ProactiveStartSkipReason(manager);
         if (skipReason != null)
         {
             LogProactiveSkipped("start", skipReason);
             return;
         }
-
-        var queued = !string.IsNullOrEmpty(_proactiveTrigger);
-        if (queued && Time.unscaledTime < _proactiveDueAt)
-            return;
-        if (!queued && Time.unscaledTime < _nextProactiveAt)
-            return;
 
         var recent = string.Join(" ", _history.TakeLast(_settings.MemoryTurns * 2).Select(message => message.Content));
         var trigger = queued ? _proactiveTrigger : "quiet_idle_time";
@@ -725,6 +956,7 @@ public sealed class Controller : MonoBehaviour
         _proactiveTrigger = string.Empty;
         _proactiveDetail = string.Empty;
         _proactiveDueAt = 0f;
+        _lastProactiveSkipReason = string.Empty;
         StartRequest(
             $"This is a proactive companion cue, not a player message. Trigger: {trigger}. Context: {detail} " +
             "Say one brief, optional and natural Lilith remark. Do not claim the player just said anything, do not mention the trigger, and do not change clothing or execute a command.",
@@ -754,11 +986,10 @@ public sealed class Controller : MonoBehaviour
     [HideFromIl2Cpp]
     private void LogProactiveSkipped(string trigger, string reason)
     {
-        if (string.Equals(_lastProactiveSkipReason, reason, StringComparison.Ordinal) &&
-            Time.unscaledTime - _lastProactiveSkipLoggedAt < 10f)
+        var key = $"{trigger}:{reason}";
+        if (string.Equals(_lastProactiveSkipReason, key, StringComparison.Ordinal))
             return;
-        _lastProactiveSkipReason = reason;
-        _lastProactiveSkipLoggedAt = Time.unscaledTime;
+        _lastProactiveSkipReason = key;
         Plugin.LogSource.LogInfo($"Skipped proactive AI cue: trigger={trigger}, reason={reason}");
     }
 
@@ -771,6 +1002,13 @@ public sealed class Controller : MonoBehaviour
         try
         {
             var reply = _request.GetAwaiter().GetResult();
+            var normalizedReply = DisplayLanguage.NormalizeReply(
+                reply,
+                _requestLanguage,
+                message => Plugin.LogSource.LogWarning(message));
+            if (normalizedReply.Text != reply.Text || normalizedReply.Speech != reply.Speech || normalizedReply.Memory != reply.Memory)
+                Plugin.LogSource.LogInfo($"AI DISPLAY NORMALIZED\nLanguage: {_requestLanguage}");
+            reply = normalizedReply;
             if (_requestIsProactive)
             {
                 reply = reply with { Clothing = "None", Command = "None", Argument = string.Empty };
@@ -1054,14 +1292,24 @@ public sealed class Controller : MonoBehaviour
         }
 
         var action = LilithActionType.None;
-        if (Enum.TryParse<LilithActionType>(reply.Action, true, out var requested) && AllowedActions.Contains(requested))
-            action = requested;
+        if (Enum.TryParse<LilithActionType>(reply.Action, true, out var requested) &&
+            AllowedActions.Contains(requested) && requested != LilithActionType.None)
+        {
+            var state = UnityEngine.Object.FindObjectOfType<LilithStateManager>();
+            if (state?.HasActionAnimation(requested) == true)
+                action = requested;
+            else
+                Plugin.LogSource.LogWarning($"Unsupported dialogue action '{requested}' for the current Lilith state; using no action");
+        }
 
         bool shown;
         _isSubmittingAiDialogue = true;
         try
         {
-            shown = manager.Say(reply.Text, action, string.Empty, TtsClient.DialogueDuration(speechClip?.length ?? 0f));
+            var duration = TtsClient.DialogueDuration(speechClip?.length ?? 0f);
+            shown = action == LilithActionType.None
+                ? manager.Say(reply.Text, string.Empty, duration)
+                : manager.Say(reply.Text, action, string.Empty, duration);
         }
         finally
         {
@@ -1786,7 +2034,6 @@ public sealed class Controller : MonoBehaviour
     [HideFromIl2Cpp]
     private void EnsureTrayActions()
     {
-        _headerAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(NoOp));
         _focusGameWindowAction ??= DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(FocusGameWindow));
         _endKeyboardInputAction ??= DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(EndKeyboardInput));
         _saveTrayInputAction ??= DelegateSupport.ConvertDelegate<UnityAction<string>>(new System.Action<string>(SaveTrayInput));
@@ -1934,55 +2181,50 @@ public sealed class Controller : MonoBehaviour
 
         if (_settingsView != null && _settingsView != view)
         {
-            if (_trayCustomRoot != null)
-                UnityEngine.Object.Destroy(_trayCustomRoot);
-            _trayCustomRoot = null;
-            _trayHeaderLabel = null;
-            _trayProviderToggle = null;
-            _trayBaseUrlInput = null;
-            _trayModelToggle = null;
-            _trayProactiveToggle = null;
-            _trayProactiveChanceToggle = null;
-            _trayProactiveCooldownToggle = null;
-            _trayVoiceHeaderLabel = null;
-            _trayVoiceToggle = null;
-            _trayVoiceRestartToggle = null;
-            _trayApiKeyInput = null;
-            _trayPromptInput = null;
-            _trayContent = null;
-            _trayViewport = null;
-            _trayScrollRect = null;
-            _trayAiContent = null;
-            _trayAiNativeContentHeight = 0f;
-            _trayScrollReady = false;
+            DisposeTraySettings();
             _lastTrayTab = null;
         }
 
         _settingsView = view;
+        if (view._currentTab == TraySettingTab.Language)
+        {
+            _trayCustomRoot?.SetActive(false);
+            EnsureLanguageVoiceSettings();
+            return;
+        }
+
+        _trayVoiceRoot?.SetActive(false);
         if (view._currentTab != TraySettingTab.Lilith)
         {
             _trayCustomRoot?.SetActive(false);
             return;
         }
 
-        if (_trayCustomRoot != null && _trayHeaderLabel != null && _trayProviderToggle != null &&
-            _trayBaseUrlInput != null && _trayModelToggle != null &&
+        if (_trayCustomRoot != null && _trayProviderSelector != null && _trayModelSelector != null &&
+            _trayBaseUrlInput != null &&
             _trayApiKeyInput != null && _trayPromptInput != null && _trayAiContent != null &&
-            _trayProactiveToggle != null && _trayProactiveChanceToggle != null && _trayProactiveCooldownToggle != null &&
-            _trayVoiceHeaderLabel != null && _trayVoiceToggle != null && _trayVoiceRestartToggle != null &&
+            _trayProactiveSwitch != null && _trayProactiveChanceSelector != null && _trayProactiveCooldownSelector != null &&
             _trayCustomRoot.transform.parent == view._settingItemRoot)
         {
             _trayCustomRoot.SetActive(true);
             if (_trayContent != _trayAiContent)
                 EnsureWheelScrolling(_trayAiContent);
+            RebuildTrayLayout(_trayAiContent, false);
             return;
         }
 
         if (_trayCustomRoot != null)
-        {
-            UnityEngine.Object.Destroy(_trayCustomRoot);
-            _trayCustomRoot = null;
-        }
+            DisposeTrayRoot(_trayCustomRoot);
+        _trayCustomRoot = null;
+        _trayProviderSelector = null;
+        _trayModelSelector = null;
+        _trayProactiveSwitch = null;
+        _trayProactiveChanceSelector = null;
+        _trayProactiveCooldownSelector = null;
+        _trayBaseUrlInput = null;
+        _trayApiKeyInput = null;
+        _trayPromptInput = null;
+        _trayAiContent = null;
 
         try
         {
@@ -1992,119 +2234,117 @@ public sealed class Controller : MonoBehaviour
             var rowsContainer = settingRoot.GetComponent<RectTransform>();
             if (rowsContainer == null || rowsContainer.parent == null)
                 return;
-            var nativeContentHeight = LayoutUtility.GetPreferredHeight(rowsContainer);
-            if (nativeContentHeight <= 0f)
-                nativeContentHeight = rowsContainer.rect.height;
-            nativeContentHeight += 8f;
             var inputTemplate = FindNativeSettingTemplate<SettingInputFieldItem>(view);
-            var buttonTemplate = FindNativeSettingTemplate<SettingBigButtonItem>(view);
-            var toggleTemplate = FindNativeSettingTemplate<SettingToggleItem>(view);
+            var selectorTemplate = FindNativeSettingTemplate<SettingLanguageSetItem>(view);
             var switchTemplate = FindNativeSettingTemplate<SettingSwitchItems>(view);
-            if (inputTemplate == null || buttonTemplate == null || toggleTemplate == null || switchTemplate == null)
-                throw new InvalidOperationException("TraySettingNew has no reusable native input/button/toggle setting items");
+            if (inputTemplate == null || selectorTemplate == null || switchTemplate == null)
+                throw new InvalidOperationException("TraySettingNew has no reusable native input/selector/switch setting items");
 
             EnsureTrayActions();
             ResetModelsForProvider();
 
-            _trayCustomRoot = new GameObject("LilithAISettings");
-            var customRoot = _trayCustomRoot.GetComponent<RectTransform>() ??
-                             _trayCustomRoot.AddComponent<RectTransform>();
-            if (customRoot == null || _trayCustomRoot.GetComponent<RectTransform>() != customRoot)
-                throw new InvalidOperationException("LilithAI settings root has no RectTransform");
-            customRoot.SetParent(settingRoot, false);
-            customRoot.anchorMin = new Vector2(0f, 1f);
-            customRoot.anchorMax = new Vector2(1f, 1f);
-            customRoot.pivot = new Vector2(0.5f, 1f);
-            customRoot.anchoredPosition = new Vector2(0f, -nativeContentHeight);
-            customRoot.sizeDelta = Vector2.zero;
-            var group = _trayCustomRoot.AddComponent<VerticalLayoutGroup>();
-            group.childControlWidth = true;
-            group.childControlHeight = true;
-            group.childForceExpandWidth = true;
-            group.childForceExpandHeight = false;
-            group.spacing = 4f;
-            var fitter = _trayCustomRoot.AddComponent<ContentSizeFitter>();
-            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
-            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-
-            var header = CloneButton(buttonTemplate, customRoot, "LilithAIHeaderRow",
-                T("AI 莉莉絲聊天設定", "AI 莉莉丝聊天设置", "AI リリス チャット設定", "Lilith AI Chat Settings"), _headerAction!, false);
-            _trayHeaderLabel = header._buttonText;
-            SetFeatureRowHeight(header);
-            SetLabel(_trayHeaderLabel, T("AI 莉莉絲聊天設定", "AI 莉莉丝聊天设置", "AI リリス チャット設定", "Lilith AI Chat Settings"));
-            _trayHeaderLabel.fontStyle |= FontStyles.Bold;
-            _trayHeaderLabel.enableWordWrapping = false;
-            _trayHeaderLabel.alignment = TextAlignmentOptions.Center;
-
-            _trayProviderToggle = CloneNativeToggle(toggleTemplate, customRoot, "LilithAIProviderRow",
-                T("供應商", "提供商", "プロバイダー", "Provider"), ProviderToggleOptions(),
-                Array.IndexOf(Enum.GetValues<ProviderKind>(), _provider), ProviderToggleChanged);
-            _trayModelToggle = CloneNativeToggle(toggleTemplate, customRoot, "LilithAIModelRow",
-                T("模型", "模型", "モデル", "Model"), ModelToggleOptions(), ModelToggleIndex(), ModelToggleChanged);
-            _trayProactiveToggle = CloneNativeSwitch(switchTemplate, customRoot, "LilithAIProactiveRow",
-                T("AI 主動說話", "AI 主动说话", "AIの自発会話", "Proactive AI"), _settings.ProactiveDialogue, ProactiveToggleChanged);
-            _trayProactiveChanceToggle = CloneNativeToggle(toggleTemplate, customRoot, "LilithAIProactiveChanceRow",
-                T("事件回應機率", "事件回应概率", "イベント反応率", "Event chance"), ProactiveChanceToggleOptions(),
-                ProactiveChanceIndex(), ProactiveChanceToggleChanged);
-            _trayProactiveCooldownToggle = CloneNativeToggle(toggleTemplate, customRoot, "LilithAIProactiveCooldownRow",
-                T("最短冷卻", "最短冷却", "最短クールダウン", "Minimum cooldown"), ProactiveCooldownToggleOptions(),
-                ProactiveCooldownIndex(), ProactiveCooldownToggleChanged);
-            var voiceHeader = CloneButton(buttonTemplate, customRoot, "LilithAIVoiceHeaderRow",
-                T("AI 語音設定", "AI 语音设置", "AI 音声設定", "Lilith AI Voice Settings"), _headerAction!, false);
-            _trayVoiceHeaderLabel = voiceHeader._buttonText;
-            SetFeatureRowHeight(voiceHeader);
-            _trayVoiceToggle = CloneNativeToggle(toggleTemplate, customRoot, "LilithAIVoiceModeRow",
-                T("語音", "语音", "音声", "Voice"), VoiceToggleOptions(), (int)_voiceMode, VoiceToggleChanged);
-            _trayVoiceRestartToggle = CloneNativeSwitch(switchTemplate, customRoot, "LilithAIVoiceRestartRow",
-                T("本機語音自動重啟", "本地语音自动重启", "ローカル音声の自動再起動", "Local voice auto-restart"),
-                _settings.AutoStartVoiceService, VoiceRestartToggleChanged);
-            _trayBaseUrlInput = CloneInput(inputTemplate, customRoot, "LilithAIBaseUrlRow",
-                T("API 位址", "API 地址", "API URL", "API URL"), _baseUrl);
-            SetInputRowHeight(_trayBaseUrlInput, 56f, 36f);
-            _trayApiKeyInput = CloneInput(inputTemplate, customRoot, "LilithAIApiKeyRow", "API Key", _apiKey);
-            SetInputRowHeight(_trayApiKeyInput, 56f, 36f);
+            var customRoot = CreateTraySettingsRoot(settingRoot, "LilithAISettings");
+            _trayCustomRoot = customRoot.gameObject;
+            _trayProviderSelector = CloneNativeSelector(selectorTemplate, customRoot, "LilithAIProviderRow",
+                T("供應商", "提供商", "プロバイダー", "Provider"), ProviderSelectorOptions(),
+                Array.IndexOf(Enum.GetValues<ProviderKind>(), _provider), ProviderSelectorChanged);
+            _trayModelSelector = CloneNativeSelector(selectorTemplate, customRoot, "LilithAIModelRow",
+                T("模型", "模型", "モデル", "Model"), ModelSelectorOptions(), ModelSelectorIndex(), ModelSelectorChanged,
+                null, CanRequestSelfHostedModels);
+            _trayProactiveSwitch = CloneNativeSwitch(switchTemplate, customRoot, "LilithAIProactiveRow",
+                T("AI 主動說話", "AI 主动说话", "AIの自発会話", "Proactive AI"), _settings.ProactiveDialogue, ProactiveSwitchChanged);
+            _trayProactiveChanceSelector = CloneNativeSelector(selectorTemplate, customRoot, "LilithAIProactiveChanceRow",
+                T("事件回應機率", "事件回应概率", "イベント反応率", "Event chance"), ProactiveChanceOptions(),
+                ProactiveChanceIndex(), ProactiveChanceSelectorChanged);
+            _trayProactiveCooldownSelector = CloneNativeSelector(selectorTemplate, customRoot, "LilithAIProactiveCooldownRow",
+                T("最短冷卻", "最短冷却", "最短クールダウン", "Minimum cooldown"), ProactiveCooldownOptions(),
+                ProactiveCooldownIndex(), ProactiveCooldownSelectorChanged);
+            _trayBaseUrlInput = CloneNativeInput(inputTemplate, customRoot, "LilithAIBaseUrlRow",
+                T("API 位址", "API 地址", "API URL", "API URL"), _baseUrl, string.Empty);
+            _trayApiKeyInput = CloneNativeInput(inputTemplate, customRoot, "LilithAIApiKeyRow", "API Key", _apiKey, string.Empty);
             _trayApiKeyInput.contentType = TMP_InputField.ContentType.Password;
             _trayApiKeyInput.ForceLabelUpdate();
-            _trayPromptInput = CloneInput(inputTemplate, customRoot, "LilithAIPromptRow",
+            _trayPromptInput = CloneNativeInput(inputTemplate, customRoot, "LilithAIPromptRow",
                 T("莉莉絲角色設定", "莉莉丝角色设定", "リリスのキャラクター設定", "Lilith Character Prompt"),
-                _usesDefaultPrompt ? ProviderProfiles.CharacterPrompt(GameSetting.Language) : _prompt);
-            _trayPromptInput.lineType = TMP_InputField.LineType.MultiLineNewline;
-            _trayPromptInput.scrollSensitivity = 30f;
-            if (_trayPromptInput.textComponent != null)
-                _trayPromptInput.textComponent.enableWordWrapping = true;
-            SetInputRowHeight(_trayPromptInput, 150f, 110f);
+                _usesDefaultPrompt ? ProviderProfiles.CharacterPrompt(GameSetting.Language) : _prompt, string.Empty);
             _trayAiContent = rowsContainer;
-            _trayAiNativeContentHeight = nativeContentHeight;
+            customRoot.gameObject.SetActive(true);
             Canvas.ForceUpdateCanvases();
             EnsureWheelScrolling(rowsContainer);
             RefreshLocalizedUi();
             RefreshProviderRows();
-            ActivateTrayLayout(rowsContainer, _trayCustomRoot, nativeContentHeight);
+            RebuildTrayLayout(rowsContainer, true);
             Plugin.LogSource.LogInfo("Added Lilith AI controls to TraySettingNewView");
         }
         catch
         {
-            if (_trayCustomRoot != null)
-                UnityEngine.Object.Destroy(_trayCustomRoot);
-            _trayCustomRoot = null;
-            _trayHeaderLabel = null;
-            _trayProviderToggle = null;
-            _trayBaseUrlInput = null;
-            _trayModelToggle = null;
-            _trayProactiveToggle = null;
-            _trayProactiveChanceToggle = null;
-            _trayProactiveCooldownToggle = null;
-            _trayVoiceHeaderLabel = null;
-            _trayVoiceToggle = null;
-            _trayVoiceRestartToggle = null;
-            _trayApiKeyInput = null;
-            _trayPromptInput = null;
-            _trayContent = null;
-            _trayViewport = null;
-            _trayScrollRect = null;
-            _trayAiContent = null;
-            _trayAiNativeContentHeight = 0f;
-            _trayScrollReady = false;
+            DisposeTraySettings();
+            throw;
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private void EnsureLanguageVoiceSettings()
+    {
+        var view = _settingsView ?? UnityEngine.Object.FindObjectOfType<TraySettingNewView>();
+        if (view == null || view._currentTab != TraySettingTab.Language)
+            return;
+
+        if (_trayVoiceRoot != null && _trayVoiceSelector != null && _trayVoiceRestartSwitch != null &&
+            _trayVoiceContent != null && _trayVoiceRoot.transform.parent == view._settingItemRoot)
+        {
+            _trayVoiceRoot.SetActive(true);
+            _trayCustomRoot?.SetActive(false);
+            RebuildTrayLayout(_trayVoiceContent, false);
+            return;
+        }
+
+        if (_trayVoiceRoot != null)
+            DisposeTrayRoot(_trayVoiceRoot);
+        _trayVoiceRoot = null;
+        _trayVoiceSelector = null;
+        _trayVoiceRestartSwitch = null;
+        _trayVoiceContent = null;
+
+        try
+        {
+            var settingRoot = view._settingItemRoot;
+            if (settingRoot == null || !view._tabsBuilt)
+                return;
+            var rowsContainer = settingRoot.GetComponent<RectTransform>();
+            if (rowsContainer == null || rowsContainer.parent == null)
+                return;
+            var selectorTemplate = FindNativeSettingTemplate<SettingLanguageSetItem>(view);
+            var switchTemplate = FindNativeSettingTemplate<SettingSwitchItems>(view);
+            if (selectorTemplate == null || switchTemplate == null)
+                throw new InvalidOperationException("TraySettingNew has no reusable native voice selector/switch setting items");
+
+            EnsureTrayActions();
+            var customRoot = CreateTraySettingsRoot(settingRoot, "LilithAIVoiceSettings");
+            _trayVoiceRoot = customRoot.gameObject;
+            _trayVoiceSelector = CloneNativeSelector(selectorTemplate, customRoot, "LilithAIVoiceModeRow",
+                T("語音", "语音", "音声", "Voice"), VoiceSelectorOptions(), (int)_voiceMode, VoiceSelectorChanged,
+                VoiceSelectorValue);
+            _trayVoiceRestartSwitch = CloneNativeSwitch(switchTemplate, customRoot, "LilithAIVoiceRestartRow",
+                T("本機語音自動重啟", "本地语音自动重启", "ローカル音声の自動再起動", "Local voice auto-restart"),
+                _settings.AutoStartVoiceService, VoiceRestartSwitchChanged);
+
+            _trayVoiceContent = rowsContainer;
+            customRoot.gameObject.SetActive(true);
+            Canvas.ForceUpdateCanvases();
+            EnsureWheelScrolling(rowsContainer);
+            RefreshLocalizedUi();
+            RebuildTrayLayout(rowsContainer, false);
+            Plugin.LogSource.LogInfo("Added Lilith AI voice controls to native Language tab");
+        }
+        catch
+        {
+            if (_trayVoiceRoot != null)
+                DisposeTrayRoot(_trayVoiceRoot);
+            _trayVoiceRoot = null;
+            _trayVoiceSelector = null;
+            _trayVoiceRestartSwitch = null;
+            _trayVoiceContent = null;
             throw;
         }
     }
@@ -2253,11 +2493,10 @@ public sealed class Controller : MonoBehaviour
         _closeChatAction ??= DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(CancelChat));
 
         var sourceTitle = FindDirectChildComponent<TMP_Text>(naming._rootTransform, NativeNamingTitleChildIndex);
-        var sourceCancelButton = FindDirectChildComponent<Button>(naming._rootTransform, NativeNamingCancelChildIndex);
-        if (sourceTitle == null || sourceCancelButton == null || sourceCancelButton == naming._confirmButton)
+        if (sourceTitle == null || naming._nameInputField == null || naming._confirmButton == null)
         {
             Plugin.LogSource.LogWarning(
-                $"Could not map native NamingView chat controls from the verified hierarchy: title={DescribeComponent(sourceTitle)}, cancel={DescribeComponent(sourceCancelButton)}, confirm={DescribeComponent(naming._confirmButton)}");
+                $"Could not map native NamingView chat controls from the verified hierarchy: title={DescribeComponent(sourceTitle)}, input={DescribeComponent(naming._nameInputField)}, confirm={DescribeComponent(naming._confirmButton)}");
             return;
         }
 
@@ -2265,7 +2504,15 @@ public sealed class Controller : MonoBehaviour
         _chatRoot.name = "LilithAIChat";
         _chatInput = FindClonedComponent(naming._rootTransform, _chatRoot, naming._nameInputField);
         _chatSendButton = FindClonedComponent(naming._rootTransform, _chatRoot, naming._confirmButton);
-        _chatCancelButton = FindClonedComponent(naming._rootTransform, _chatRoot, sourceCancelButton);
+        _chatCancelButton = null;
+        if (_chatSendButton != null && _chatSendButton.transform.parent != null)
+        {
+            var cancelObject = UnityEngine.Object.Instantiate(
+                _chatSendButton.gameObject,
+                _chatSendButton.transform.parent);
+            cancelObject.name = "LilithAIChatCancel";
+            _chatCancelButton = cancelObject.GetComponent<Button>();
+        }
         _chatTitle = FindClonedComponent(naming._rootTransform, _chatRoot, sourceTitle);
         var buttons = _chatRoot.GetComponentsInChildren<Button>(true);
         foreach (var button in buttons)
@@ -2547,37 +2794,66 @@ public sealed class Controller : MonoBehaviour
     private static T? FindNativeSettingTemplate<T>(TraySettingNewView view) where T : Component
     {
         var items = UnityEngine.Resources.FindObjectsOfTypeAll<T>();
-        return items.FirstOrDefault(item => !item.gameObject.scene.IsValid()) ??
-               items.FirstOrDefault(item => item.transform.IsChildOf(view.transform));
+        // Prefer the concrete row already present in the live settings view.  The
+        // asset prefab can contain editor-only/alternate labels (for example two
+        // TMP texts inside the language selector), while the scene row is the
+        // exact native control the player sees and its arrow fields are stable.
+        return items.FirstOrDefault(item => item.transform.IsChildOf(view.transform)) ??
+               items.FirstOrDefault(item => !item.gameObject.scene.IsValid());
     }
 
     [HideFromIl2Cpp]
-    private TMP_InputField CloneInput(SettingInputFieldItem template, Transform parent, string rowName, string labelText, string value)
+    private TMP_InputField CloneNativeInput(
+        SettingInputFieldItem template,
+        Transform parent,
+        string rowName,
+        string labelText,
+        string value,
+        string placeholder)
     {
         var row = UnityEngine.Object.Instantiate(template.gameObject, parent);
         row.name = rowName;
         row.SetActive(true);
+        SetNativeSettingRowHeight(row);
         var item = row.GetComponent<SettingInputFieldItem>() ??
                    throw new InvalidOperationException("TraySettingNew input item has no component");
         var input = item._inputField ??
                     throw new InvalidOperationException("TraySettingNew input item has no input field");
-        if (item._nameText != null)
-            SetLabel(item._nameText, labelText);
+        var title = item._nameText ?? item.GetComponentsInChildren<TMP_Text>(true)
+            .FirstOrDefault(label => !label.transform.IsChildOf(input.transform));
+        if (title != null)
+            SetLabel(title, labelText);
         item._currentValue = value;
         input.onValueChanged.RemoveAllListeners();
         input.onEndEdit.RemoveAllListeners();
         input.onSelect.RemoveAllListeners();
         input.onDeselect.RemoveAllListeners();
         input.onSubmit.RemoveAllListeners();
-        item._editButton?.onClick.RemoveAllListeners();
+        if (item._editButton != null)
+            ClearNativeButtonListeners(item._editButton);
         item.OnValueChanged = null;
-        input.onSelect.AddListener(_focusGameWindowAction!);
-        input.onDeselect.AddListener(_endKeyboardInputAction!);
-        input.onEndEdit.AddListener(_saveTrayInputAction!);
         input.interactable = true;
         input.readOnly = false;
+        input.lineType = TMP_InputField.LineType.SingleLine;
         input.enabled = true;
+        if (input.textComponent != null)
+        {
+            input.textComponent.enableWordWrapping = false;
+            input.textComponent.overflowMode = TextOverflowModes.Overflow;
+        }
+        if (input.placeholder is TMP_Text placeholderText)
+            SetLabel(placeholderText, placeholder);
         input.SetTextWithoutNotify(value);
+        var editButton = item._editButton == null ? null : DetachNativeButton(item._editButton);
+        var binding = new NativeInputBinding(
+            row,
+            input,
+            editButton,
+            _focusGameWindowAction!,
+            _endKeyboardInputAction!,
+            _saveTrayInputAction!);
+        UnityEngine.Object.Destroy(item);
+        _trayInputs.Add(binding);
         return input;
     }
 
@@ -2594,71 +2870,153 @@ public sealed class Controller : MonoBehaviour
     private void SaveTrayInput(string _) => SyncTraySettings();
 
     [HideFromIl2Cpp]
-    private static SettingBigButtonItem CloneButton(
-        SettingBigButtonItem template,
-        Transform parent,
-        string rowName,
-        string text,
-        UnityAction action,
-        bool interactable)
+    private static void ClearNativeButtonListeners(Button button)
     {
-        var row = UnityEngine.Object.Instantiate(template.gameObject, parent);
-        row.name = rowName;
-        row.SetActive(true);
-        var item = row.GetComponent<SettingBigButtonItem>() ??
-                   throw new InvalidOperationException("TraySettingNew button item has no component");
-        var button = item._button ??
-                     throw new InvalidOperationException("TraySettingNew button item has no button");
-        var label = item._buttonText ??
-                    throw new InvalidOperationException("TraySettingNew button item has no text");
-        button.onClick.RemoveAllListeners();
-        item.OnValueChanged = null;
-        button.onClick.AddListener(action);
-        button.interactable = interactable;
-        SetLabel(label, text);
-        return item;
+        var click = button.onClick;
+        for (var index = 0; index < click.GetPersistentEventCount(); index++)
+            click.SetPersistentListenerState(index, UnityEventCallState.Off);
+        click.RemoveAllListeners();
     }
 
     [HideFromIl2Cpp]
-    private static SettingToggleItem CloneNativeToggle(
-        SettingToggleItem template,
+    private static Button DetachNativeButton(Button nativeButton)
+    {
+        nativeButton.enabled = false;
+        var nativeRect = nativeButton.gameObject.GetComponent<RectTransform>() ??
+                         throw new InvalidOperationException("Native button has no RectTransform");
+        var overlay = new GameObject($"{nativeButton.gameObject.name}_LilithAIInput");
+        var overlayRect = overlay.AddComponent<RectTransform>();
+        overlayRect.SetParent(nativeRect.parent, false);
+        overlayRect.anchorMin = nativeRect.anchorMin;
+        overlayRect.anchorMax = nativeRect.anchorMax;
+        overlayRect.pivot = nativeRect.pivot;
+        overlayRect.anchoredPosition = nativeRect.anchoredPosition;
+        overlayRect.sizeDelta = nativeRect.sizeDelta;
+        overlayRect.localRotation = nativeRect.localRotation;
+        overlayRect.localScale = nativeRect.localScale;
+        overlayRect.SetSiblingIndex(nativeRect.GetSiblingIndex() + 1);
+        var layout = overlay.AddComponent<LayoutElement>();
+        layout.ignoreLayout = true;
+        var image = overlay.AddComponent<Image>();
+        image.color = Color.clear;
+        image.raycastTarget = true;
+        var detached = overlay.AddComponent<Button>();
+        detached.targetGraphic = image;
+        detached.transition = Selectable.Transition.None;
+        detached.interactable = true;
+        return detached;
+    }
+
+    [HideFromIl2Cpp]
+    private static RectTransform CreateTraySettingsRoot(Transform parent, string name)
+    {
+        var root = new GameObject(name);
+        var rect = root.AddComponent<RectTransform>();
+        rect.SetParent(parent, false);
+        rect.anchorMin = new Vector2(0f, 1f);
+        rect.anchorMax = new Vector2(1f, 1f);
+        rect.pivot = new Vector2(0.5f, 1f);
+        rect.anchoredPosition = Vector2.zero;
+        rect.sizeDelta = Vector2.zero;
+        var group = root.AddComponent<VerticalLayoutGroup>();
+        group.childControlWidth = true;
+        group.childControlHeight = true;
+        group.childForceExpandWidth = true;
+        group.childForceExpandHeight = false;
+        group.spacing = 5f;
+        var fitter = root.AddComponent<ContentSizeFitter>();
+        fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+        root.SetActive(false);
+        return rect;
+    }
+
+    [HideFromIl2Cpp]
+    private static void SetNativeSettingRowHeight(GameObject row)
+    {
+        var rect = row.GetComponent<RectTransform>();
+        if (rect != null)
+            rect.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, 30f);
+        var layout = row.GetComponent<LayoutElement>() ?? row.AddComponent<LayoutElement>();
+        layout.minHeight = 30f;
+        layout.preferredHeight = 30f;
+        layout.flexibleHeight = 0f;
+    }
+
+    [HideFromIl2Cpp]
+    private NativeSelectorBinding CloneNativeSelector(
+        SettingLanguageSetItem template,
         Transform parent,
         string rowName,
         string labelText,
-        ToggleOption[] options,
+        string[] options,
         int selectedIndex,
-        Action<ToggleOption> onChanged)
+        Action<int> onChanged,
+        Func<int, string>? displayValue = null,
+        Func<bool>? canInteractWhenSingleOption = null)
     {
         var row = UnityEngine.Object.Instantiate(template.gameObject, parent);
         row.name = rowName;
+        // Keep the native language controller inactive while the clone is
+        // being converted into an AI-owned selector.  Activating it first
+        // lets its OnEnable/localization path write the game language into
+        // the value label before our binding is installed.
+        row.SetActive(false);
+        SetNativeSettingRowHeight(row);
+        var item = row.GetComponent<SettingLanguageSetItem>() ??
+                   throw new InvalidOperationException("TraySettingNew language selector has no component");
+        var languageButton = item._gameLanguageButton ??
+                             throw new InvalidOperationException("TraySettingNew language selector has no game language button");
+        var previousButton = languageButton._prevButton ??
+                             throw new InvalidOperationException("TraySettingNew language selector has no previous button");
+        var nextButton = languageButton._nextButton ??
+                         throw new InvalidOperationException("TraySettingNew language selector has no next button");
+        // The arrow fields are the stable part of this native control.  Their
+        // parent is the value host in the live row; using that host avoids
+        // accidentally selecting the row title when prefab revisions expose
+        // both labels through the component root.
+        var valueHost = previousButton.transform.parent ?? nextButton.transform.parent ?? languageButton.transform;
+        var valueLabel = valueHost.GetComponentsInChildren<TMP_Text>(true)
+            .FirstOrDefault(label => label.transform.parent == valueHost) ??
+            valueHost.GetComponentsInChildren<TMP_Text>(true)
+                .FirstOrDefault(label => !label.transform.IsChildOf(previousButton.transform) &&
+                                         !label.transform.IsChildOf(nextButton.transform));
+        if (valueLabel == null)
+            throw new InvalidOperationException("TraySettingNew language selector has no value label");
+        var title = item._titleText ?? item.GetComponentsInChildren<TMP_Text>(true)
+            .FirstOrDefault(label => label != valueLabel &&
+                                     !label.transform.IsChildOf(valueHost)) ??
+            item.GetComponentsInChildren<TMP_Text>(true)
+                .FirstOrDefault(label => label != valueLabel);
+        if (title == null)
+            throw new InvalidOperationException("TraySettingNew language selector has no title");
+
+        languageButton.OnLanguageChanged = null;
+        languageButton.enabled = false;
+        item.enabled = false;
+        DisableSelectorHostBehaviours(valueHost, languageButton);
+        ClearNativeButtonListeners(previousButton);
+        ClearNativeButtonListeners(nextButton);
+        var detachedPreviousButton = DetachNativeButton(previousButton);
+        var detachedNextButton = DetachNativeButton(nextButton);
+        DisableSelectorLabelBehaviours(title);
+        DisableSelectorLabelBehaviours(valueLabel);
+        SetLabel(title, labelText);
+        SetLabel(valueLabel, options.Length == 0
+            ? "—"
+            : options[Math.Clamp(selectedIndex, 0, options.Length - 1)]);
+        var binding = new NativeSelectorBinding(row, title, valueLabel, detachedPreviousButton, detachedNextButton, onChanged,
+            displayValue, canInteractWhenSingleOption);
+        binding.SetOptions(options, selectedIndex);
+        UnityEngine.Object.Destroy(languageButton);
+        UnityEngine.Object.Destroy(item);
         row.SetActive(true);
-        var item = row.GetComponent<SettingToggleItem>() ??
-                   throw new InvalidOperationException("TraySettingNew toggle item has no component");
-        InitializeNativeToggle(item, labelText, options, selectedIndex, onChanged);
-        return item;
+        _traySelectors.Add(binding);
+        return binding;
     }
 
     [HideFromIl2Cpp]
-    private static void InitializeNativeToggle(
-        SettingToggleItem item,
-        string labelText,
-        ToggleOption[] options,
-        int selectedIndex,
-        Action<ToggleOption> onChanged)
-    {
-        if (options.Length == 0)
-            throw new InvalidOperationException("TraySettingNew toggle item has no options");
-        var optionArray = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<ToggleOption>(options);
-        var current = options[Math.Clamp(selectedIndex, 0, options.Length - 1)];
-        item.OnValueChanged = null;
-        item.Init(labelText, current, optionArray);
-        item.OnValueChanged = DelegateSupport.ConvertDelegate<Il2CppSystem.Action<ToggleOption>>(
-            new Action<ToggleOption>(onChanged));
-        RefreshNativeToggle(item, labelText, options, current);
-    }
-
-    [HideFromIl2Cpp]
-    private static SettingSwitchItems CloneNativeSwitch(
+    private NativeSwitchBinding CloneNativeSwitch(
         SettingSwitchItems template,
         Transform parent,
         string rowName,
@@ -2668,81 +3026,132 @@ public sealed class Controller : MonoBehaviour
     {
         var row = UnityEngine.Object.Instantiate(template.gameObject, parent);
         row.name = rowName;
-        row.SetActive(true);
+        row.SetActive(false);
+        SetNativeSettingRowHeight(row);
         var item = row.GetComponent<SettingSwitchItems>() ??
                    throw new InvalidOperationException("TraySettingNew switch item has no component");
+        var onButton = item._onButton ??
+                       throw new InvalidOperationException("TraySettingNew switch item has no on button");
+        var offButton = item._offButton ??
+                        throw new InvalidOperationException("TraySettingNew switch item has no off button");
+        var title = item._nameText ?? item.GetComponentsInChildren<TMP_Text>(true)
+            .FirstOrDefault(label => !label.transform.IsChildOf(onButton.transform) &&
+                                     !label.transform.IsChildOf(offButton.transform));
+        if (title == null)
+            throw new InvalidOperationException("TraySettingNew switch item has no title");
         item.OnValueChanged = null;
-        item.Init(labelText, value, new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<bool>(new[] { false, true }));
-        item.OnValueChanged = DelegateSupport.ConvertDelegate<Il2CppSystem.Action<bool>>(
-            new Action<bool>(onChanged));
-        if (item._nameText != null)
-            SetLabel(item._nameText, labelText);
-        return item;
+        ClearNativeButtonListeners(onButton);
+        ClearNativeButtonListeners(offButton);
+        var detachedOnButton = DetachNativeButton(onButton);
+        var detachedOffButton = DetachNativeButton(offButton);
+        item.enabled = false;
+        SetLabel(title, labelText);
+        var binding = new NativeSwitchBinding(row, title, detachedOnButton, detachedOffButton, value, onChanged);
+        UnityEngine.Object.Destroy(item);
+        row.SetActive(true);
+        _traySwitches.Add(binding);
+        return binding;
     }
 
     [HideFromIl2Cpp]
-    private static void RefreshNativeToggle(
-        SettingToggleItem item,
-        string labelText,
-        ToggleOption[] options,
-        ToggleOption current)
+    private void DisposeTraySettings()
     {
-        if (item._nameText != null)
-            SetLabel(item._nameText, labelText);
-        if (item._optionLabels != null)
+        if (_trayCustomRoot != null)
+            DisposeTrayRoot(_trayCustomRoot);
+        if (_trayVoiceRoot != null)
+            DisposeTrayRoot(_trayVoiceRoot);
+        RestoreTrayGeometry();
+        _trayCustomRoot = null;
+        _trayVoiceRoot = null;
+        _trayProviderSelector = null;
+        _trayModelSelector = null;
+        _trayProactiveSwitch = null;
+        _trayProactiveChanceSelector = null;
+        _trayProactiveCooldownSelector = null;
+        _trayVoiceSelector = null;
+        _trayVoiceRestartSwitch = null;
+        _trayBaseUrlInput = null;
+        _trayApiKeyInput = null;
+        _trayPromptInput = null;
+        _trayContent = null;
+        _trayViewport = null;
+        _trayAiContent = null;
+        _trayVoiceContent = null;
+        _trayContentTop = 0f;
+        _trayScrollOffset = 0f;
+        Interlocked.Exchange(ref _trayWheelDelta, 0);
+        _trayScrollReady = false;
+        _traySelectors.Clear();
+        _traySwitches.Clear();
+        _trayInputs.Clear();
+    }
+
+    [HideFromIl2Cpp]
+    private void DisposeTrayRoot(GameObject root)
+    {
+        DisposeTrayBindingsUnder(root.transform);
+        UnityEngine.Object.Destroy(root);
+    }
+
+    [HideFromIl2Cpp]
+    private void DisposeTrayBindingsUnder(Transform root)
+    {
+        foreach (var binding in _traySelectors.Where(binding => binding.Row != null && binding.Row.transform.IsChildOf(root)).ToArray())
         {
-            for (var index = 0; index < item._optionLabels.Count && index < options.Length; index++)
-                if (item._optionLabels[index] != null)
-                    SetLabel(item._optionLabels[index], options[index].Item1);
+            binding.Dispose();
+            _traySelectors.Remove(binding);
         }
-        item._currentValue = current;
-        if (item._toggles == null)
-            return;
-        for (var index = 0; index < item._toggles.Count; index++)
-            item._toggles[index]?.SetIsOnWithoutNotify(index == current.Item3);
+        foreach (var binding in _traySwitches.Where(binding => binding.Row != null && binding.Row.transform.IsChildOf(root)).ToArray())
+        {
+            binding.Dispose();
+            _traySwitches.Remove(binding);
+        }
+        foreach (var binding in _trayInputs.Where(binding => binding.Row != null && binding.Row.transform.IsChildOf(root)).ToArray())
+        {
+            binding.Dispose();
+            _trayInputs.Remove(binding);
+        }
     }
 
     [HideFromIl2Cpp]
-    private static ToggleOption[] ProviderToggleOptions() =>
-        Enum.GetValues<ProviderKind>()
-            .Select((provider, index) => new ToggleOption(provider.ToString(), provider.ToString(), index))
-            .ToArray();
+    private static string[] ProviderSelectorOptions() =>
+        Enum.GetValues<ProviderKind>().Select(provider => provider.ToString()).ToArray();
 
     [HideFromIl2Cpp]
-    private ToggleOption[] ModelToggleOptions()
-    {
-        var models = _availableModels.Count > 0
-            ? _availableModels
-            : new List<string> { T("讀取模型", "读取模型", "モデルを読み込む", "Load models") };
-        return models.Select((model, index) => new ToggleOption(model, model, index)).ToArray();
-    }
+    private string[] ModelSelectorOptions() =>
+        _availableModels.Count > 0
+            ? _availableModels.ToArray()
+            : new[]
+            {
+                _modelListRequest != null
+                    ? T("讀取模型中…", "读取模型中…", "モデルを読み込み中…", "Loading models…")
+                    : _modelListFailed
+                        ? T("模型讀取失敗", "模型读取失败", "モデルの読み込みに失敗", "Model loading failed")
+                        : T("讀取模型", "读取模型", "モデルを読み込む", "Load models"),
+            };
 
     [HideFromIl2Cpp]
-    private static ToggleOption[] VoiceToggleOptions() => new[]
+    private bool CanRequestSelfHostedModels() =>
+        ProviderProfiles.IsSelfHosted(_provider) && _availableModels.Count == 0 && _modelListRequest == null;
+
+    [HideFromIl2Cpp]
+    private static string[] VoiceSelectorOptions() => new[]
     {
-        new ToggleOption(T("關閉", "关闭", "オフ", "Off"), "Off", (int)VoiceMode.Off),
-        new ToggleOption(T("中文", "中文", "中国語", "Chinese"), "Chinese", (int)VoiceMode.Chinese),
-        new ToggleOption(T("日文", "日语", "日本語", "Japanese"), "Japanese", (int)VoiceMode.Japanese),
+        T("關閉", "关闭", "オフ", "Off"),
+        T("中文", "中文", "中国語", "Chinese"),
+        T("日文", "日语", "日本語", "Japanese"),
     };
 
     [HideFromIl2Cpp]
-    private static ToggleOption[] ProactiveChanceToggleOptions() => new[]
-    {
-        new ToggleOption("0%", "0", 0), new ToggleOption("10%", "10", 1), new ToggleOption("20%", "20", 2),
-        new ToggleOption("35%", "35", 3), new ToggleOption("50%", "50", 4), new ToggleOption("75%", "75", 5),
-        new ToggleOption("100%", "100", 6),
-    };
+    private static string[] ProactiveChanceOptions() => new[] { "0%", "10%", "20%", "35%", "50%", "75%", "100%" };
 
     [HideFromIl2Cpp]
-    private static ToggleOption[] ProactiveCooldownToggleOptions() => new[]
+    private static string[] ProactiveCooldownOptions() => new[]
     {
-        new ToggleOption(T("10 分鐘", "10 分钟", "10分", "10 min"), "10", 0),
-        new ToggleOption(T("20 分鐘", "20 分钟", "20分", "20 min"), "20", 1),
-        new ToggleOption(T("30 分鐘", "30 分钟", "30分", "30 min"), "30", 2),
-        new ToggleOption(T("45 分鐘", "45 分钟", "45分", "45 min"), "45", 3),
-        new ToggleOption(T("60 分鐘", "60 分钟", "60分", "60 min"), "60", 4),
-        new ToggleOption(T("120 分鐘", "120 分钟", "120分", "120 min"), "120", 5),
-        new ToggleOption(T("240 分鐘", "240 分钟", "240分", "240 min"), "240", 6),
+        T("10 分鐘", "10 分钟", "10分", "10 min"), T("20 分鐘", "20 分钟", "20分", "20 min"),
+        T("30 分鐘", "30 分钟", "30分", "30 min"), T("45 分鐘", "45 分钟", "45分", "45 min"),
+        T("60 分鐘", "60 分钟", "60分", "60 min"), T("120 分鐘", "120 分钟", "120分", "120 min"),
+        T("240 分鐘", "240 分钟", "240分", "240 min"),
     };
 
     [HideFromIl2Cpp]
@@ -2754,33 +3163,33 @@ public sealed class Controller : MonoBehaviour
         Array.IndexOf(new[] { 10, 20, 30, 45, 60, 120, 240 }, _settings.ProactiveCooldownMinutes);
 
     [HideFromIl2Cpp]
-    private int ModelToggleIndex() =>
+    private int ModelSelectorIndex() =>
         _availableModels.IndexOf(_model) is var index && index >= 0 ? index : 0;
 
     [HideFromIl2Cpp]
-    private void ProviderToggleChanged(ToggleOption value)
+    private void ProviderSelectorChanged(int index)
     {
         var providers = Enum.GetValues<ProviderKind>();
-        if (value.Item3 < 0 || value.Item3 >= providers.Length)
+        if (index < 0 || index >= providers.Length)
             return;
-        ChangeProvider(providers[value.Item3]);
+        ChangeProvider(providers[index]);
     }
 
     [HideFromIl2Cpp]
-    private void ModelToggleChanged(ToggleOption value)
+    private void ModelSelectorChanged(int index)
     {
-        if (_availableModels.Count == 0 || value.Item3 < 0 || value.Item3 >= _availableModels.Count)
+        if (_availableModels.Count == 0 || index < 0 || index >= _availableModels.Count)
         {
             RequestSelfHostedModels();
             return;
         }
-        _model = _availableModels[value.Item3];
+        _model = _availableModels[index];
         SaveTraySettings();
         Plugin.LogSource.LogInfo($"AI model changed to {_model}");
     }
 
     [HideFromIl2Cpp]
-    private void ProactiveToggleChanged(bool enabled)
+    private void ProactiveSwitchChanged(bool enabled)
     {
         _settings.SetProactiveDialogue(enabled);
         _proactiveTrigger = string.Empty;
@@ -2790,33 +3199,33 @@ public sealed class Controller : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
-    private void ProactiveChanceToggleChanged(ToggleOption value)
+    private void ProactiveChanceSelectorChanged(int index)
     {
         var values = new[] { 0, 10, 20, 35, 50, 75, 100 };
-        if (value.Item3 >= 0 && value.Item3 < values.Length)
-            _settings.SetProactiveChancePercent(values[value.Item3]);
+        if (index >= 0 && index < values.Length)
+            _settings.SetProactiveChancePercent(values[index]);
     }
 
     [HideFromIl2Cpp]
-    private void ProactiveCooldownToggleChanged(ToggleOption value)
+    private void ProactiveCooldownSelectorChanged(int index)
     {
         var values = new[] { 10, 20, 30, 45, 60, 120, 240 };
-        if (value.Item3 >= 0 && value.Item3 < values.Length)
+        if (index >= 0 && index < values.Length)
         {
-            _settings.SetProactiveCooldownMinutes(values[value.Item3]);
+            _settings.SetProactiveCooldownMinutes(values[index]);
             ScheduleProactiveDialogue();
         }
     }
 
     [HideFromIl2Cpp]
-    private void VoiceToggleChanged(ToggleOption value)
+    private void VoiceSelectorChanged(int index)
     {
-        if (value.Item3 is >= (int)VoiceMode.Off and <= (int)VoiceMode.Japanese)
-            SetVoiceMode((VoiceMode)value.Item3);
+        if (index is >= (int)VoiceMode.Off and <= (int)VoiceMode.Japanese)
+            SetVoiceMode((VoiceMode)index);
     }
 
     [HideFromIl2Cpp]
-    private void VoiceRestartToggleChanged(bool enabled)
+    private void VoiceRestartSwitchChanged(bool enabled)
     {
         _settings.SetAutoStartVoiceService(enabled);
         if (enabled)
@@ -2827,111 +3236,113 @@ public sealed class Controller : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
-    private static void SetInputRowHeight(TMP_InputField input, float rowHeight, float inputHeight)
-    {
-        var item = input.GetComponentInParent<SettingInputFieldItem>() ??
-                   throw new InvalidOperationException("TraySettingNew input field has no owning item");
-        var row = item.transform;
-        var rowRect = row.GetComponent<RectTransform>() ??
-                      throw new InvalidOperationException("TraySettingNew input item has no rect transform");
-        rowRect.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, rowHeight);
-        var layout = row.GetComponent<LayoutElement>() ?? row.gameObject.AddComponent<LayoutElement>();
-        layout.minHeight = rowHeight;
-        layout.preferredHeight = rowHeight;
-        var inputRect = input.GetComponent<RectTransform>();
-        inputRect.sizeDelta = new Vector2(inputRect.sizeDelta.x, inputHeight);
-        inputRect.anchorMin = new Vector2(inputRect.anchorMin.x, 0.5f);
-        inputRect.anchorMax = new Vector2(inputRect.anchorMax.x, 0.5f);
-        inputRect.pivot = new Vector2(inputRect.pivot.x, 0.5f);
-        inputRect.anchoredPosition = new Vector2(inputRect.anchoredPosition.x, 0f);
-        if (input.textViewport != null)
-        {
-            input.textViewport.anchorMin = Vector2.zero;
-            input.textViewport.anchorMax = Vector2.one;
-            input.textViewport.offsetMin = new Vector2(10f, 6f);
-            input.textViewport.offsetMax = new Vector2(-10f, -6f);
-            if (input.textViewport.GetComponent<RectMask2D>() == null)
-                input.textViewport.gameObject.AddComponent<RectMask2D>();
-        }
-        var labelRect = item?._nameText?.GetComponent<RectTransform>();
-        if (labelRect != null)
-        {
-            labelRect.anchorMin = new Vector2(labelRect.anchorMin.x, 0.5f);
-            labelRect.anchorMax = new Vector2(labelRect.anchorMax.x, 0.5f);
-            labelRect.pivot = new Vector2(labelRect.pivot.x, 0.5f);
-            labelRect.anchoredPosition = new Vector2(labelRect.anchoredPosition.x, 0f);
-        }
-    }
-
-    [HideFromIl2Cpp]
-    private static void SetFeatureRowHeight(SettingBigButtonItem item)
-    {
-        var row = item.transform.GetComponent<RectTransform>();
-        if (row != null)
-            row.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, 42f);
-        var layout = item.GetComponent<LayoutElement>() ?? item.gameObject.AddComponent<LayoutElement>();
-        layout.minHeight = 42f;
-        layout.preferredHeight = 42f;
-        if (item._buttonText != null)
-        {
-            item._buttonText.enableAutoSizing = true;
-            item._buttonText.fontSizeMin = 9f;
-            item._buttonText.enableWordWrapping = false;
-        }
-    }
-
-    [HideFromIl2Cpp]
-    private static void ApplyTrayCustomGeometry(RectTransform content, RectTransform customRoot, float nativeHeight)
-    {
-        customRoot.anchoredPosition = new Vector2(0f, -nativeHeight);
-        Canvas.ForceUpdateCanvases();
-        LayoutRebuilder.ForceRebuildLayoutImmediate(customRoot);
-        var customHeight = Math.Max(customRoot.rect.height, LayoutUtility.GetPreferredHeight(customRoot));
-        var requiredHeight = Math.Max(content.rect.height, nativeHeight + customHeight);
-        content.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, requiredHeight);
-    }
-
-    [HideFromIl2Cpp]
-    private void ActivateTrayLayout(RectTransform content, GameObject customRoot, float nativeHeight, bool resetToTop = true)
-    {
-        var customRect = customRoot.GetComponent<RectTransform>();
-        if (customRect == null)
-            return;
-        EnsureWheelScrolling(content);
-        LayoutRebuilder.ForceRebuildLayoutImmediate(content);
-        ApplyTrayCustomGeometry(content, customRect, nativeHeight);
-        _trayScrollReady = true;
-        if (resetToTop)
-            ScrollTrayToTop();
-    }
-
-    [HideFromIl2Cpp]
     private void EnsureWheelScrolling(RectTransform content)
     {
-        var viewport = content.parent as RectTransform ??
+        var viewport = content.parent?.GetComponent<RectTransform>() ??
                        throw new InvalidOperationException($"Settings content has no RectTransform viewport: {UiPath(content)}");
+        if (_trayGeometryContent != null && _trayGeometryContent != content)
+            RestoreTrayGeometry();
+        CaptureTrayGeometry(content, viewport);
         if (!_trayScrollLogged)
         {
             _trayScrollLogged = true;
-            Plugin.LogSource.LogInfo($"Tray ScrollRect binding: viewport={DescribeTransform(viewport)} content={DescribeTransform(content)} viewportRect={viewport.rect.width:0.#}x{viewport.rect.height:0.#}");
+            Plugin.LogSource.LogInfo($"Tray wheel binding: viewport={DescribeTransform(viewport)} content={DescribeTransform(content)} viewportRect={viewport.rect.width:0.#}x{viewport.rect.height:0.#}");
         }
         if (viewport.GetComponent<RectMask2D>() == null && viewport.GetComponent<Mask>() == null)
-            viewport.gameObject.AddComponent<RectMask2D>();
-        var fitter = content.GetComponent<ContentSizeFitter>() ?? content.gameObject.AddComponent<ContentSizeFitter>();
-        fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
-        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-        var scrollRect = viewport.GetComponent<ScrollRect>() ?? viewport.gameObject.AddComponent<ScrollRect>();
-        scrollRect.content = content;
-        scrollRect.viewport = viewport;
-        scrollRect.horizontal = false;
-        scrollRect.vertical = true;
-        scrollRect.movementType = ScrollRect.MovementType.Clamped;
-        scrollRect.inertia = true;
-        scrollRect.decelerationRate = 0.12f;
-        scrollRect.scrollSensitivity = 30f;
+            _trayAddedMask ??= viewport.gameObject.AddComponent<RectMask2D>();
         _trayContent = content;
         _trayViewport = viewport;
-        _trayScrollRect = scrollRect;
+    }
+
+    [HideFromIl2Cpp]
+    private void CaptureTrayGeometry(RectTransform content, RectTransform viewport)
+    {
+        if (_trayGeometryContent == content)
+            return;
+
+        _trayGeometryContent = content;
+        _trayOriginalAnchorMin = content.anchorMin;
+        _trayOriginalAnchorMax = content.anchorMax;
+        _trayOriginalPivot = content.pivot;
+        _trayOriginalAnchoredPosition = content.anchoredPosition;
+        _trayOriginalSizeDelta = content.sizeDelta;
+        _trayOriginalHeight = content.rect.height;
+
+        var contentTop = viewport.InverseTransformPoint(
+            content.TransformPoint(new Vector3(0f, content.rect.yMax, 0f))).y;
+        var contentBottom = viewport.InverseTransformPoint(
+            content.TransformPoint(new Vector3(0f, content.rect.yMin, 0f))).y;
+        _trayTopInset = Math.Max(0f, viewport.rect.yMax - contentTop);
+        _trayBottomInset = Math.Max(0f, contentBottom - viewport.rect.yMin);
+
+        var minimumHeight = Math.Max(0f, viewport.rect.height - _trayTopInset - _trayBottomInset);
+        _trayOriginalHeight = Math.Max(_trayOriginalHeight, minimumHeight);
+
+        // Anchor the content to the viewport top before any layout growth.
+        // This keeps the native top margin fixed while additional rows extend
+        // only below the visible area.
+        content.anchorMin = new Vector2(content.anchorMin.x, 1f);
+        content.anchorMax = new Vector2(content.anchorMax.x, 1f);
+        content.pivot = new Vector2(content.pivot.x, 1f);
+        content.anchoredPosition = new Vector2(content.anchoredPosition.x, -_trayTopInset);
+        content.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, _trayOriginalHeight);
+        _trayContentTop = content.anchoredPosition.y;
+        _trayScrollOffset = 0f;
+    }
+
+    [HideFromIl2Cpp]
+    private void RebuildTrayLayout(RectTransform content, bool resetToTop)
+    {
+        EnsureWheelScrolling(content);
+        Canvas.ForceUpdateCanvases();
+        LayoutRebuilder.ForceRebuildLayoutImmediate(content);
+        foreach (var child in content.GetComponentsInChildren<RectTransform>(true))
+        {
+            if (child == content)
+                continue;
+            if (child.gameObject == _trayCustomRoot || child.gameObject == _trayVoiceRoot)
+                LayoutRebuilder.ForceRebuildLayoutImmediate(child);
+        }
+
+        LayoutRebuilder.ForceRebuildLayoutImmediate(content);
+        var preferredHeight = LayoutUtility.GetPreferredHeight(content);
+        if (float.IsNaN(preferredHeight) || float.IsInfinity(preferredHeight))
+            preferredHeight = content.rect.height;
+        var minimumHeight = Math.Max(_trayOriginalHeight,
+            Math.Max(0f, (_trayViewport?.rect.height ?? content.rect.height) - _trayTopInset - _trayBottomInset));
+        content.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical,
+            Math.Max(minimumHeight, preferredHeight));
+        Canvas.ForceUpdateCanvases();
+        LayoutRebuilder.ForceRebuildLayoutImmediate(content);
+        _trayScrollReady = true;
+        if (resetToTop)
+            _trayScrollOffset = 0f;
+        ApplyTrayScroll();
+    }
+
+    [HideFromIl2Cpp]
+    private void RestoreTrayGeometry()
+    {
+        var content = _trayGeometryContent;
+        if (content != null)
+        {
+            content.anchorMin = _trayOriginalAnchorMin;
+            content.anchorMax = _trayOriginalAnchorMax;
+            content.pivot = _trayOriginalPivot;
+            content.anchoredPosition = _trayOriginalAnchoredPosition;
+            content.sizeDelta = _trayOriginalSizeDelta;
+        }
+
+        if (_trayAddedMask != null)
+            UnityEngine.Object.Destroy(_trayAddedMask);
+
+        _trayGeometryContent = null;
+        _trayAddedMask = null;
+        _trayOriginalHeight = 0f;
+        _trayTopInset = 0f;
+        _trayBottomInset = 0f;
+        _trayContentTop = 0f;
+        _trayScrollOffset = 0f;
     }
 
     [HideFromIl2Cpp]
@@ -2952,6 +3363,29 @@ public sealed class Controller : MonoBehaviour
             if (typeName.Contains("Localiz", StringComparison.OrdinalIgnoreCase) ||
                 typeName.Contains("Language", StringComparison.OrdinalIgnoreCase))
                 behaviour.enabled = false;
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private static void DisableSelectorHostBehaviours(Transform host, Behaviour preserve)
+    {
+        foreach (var behaviour in host.GetComponents<Behaviour>())
+        {
+            if (behaviour == null || behaviour == preserve)
+                continue;
+            behaviour.enabled = false;
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private static void DisableSelectorLabelBehaviours(TMP_Text label)
+    {
+        foreach (var behaviour in label.GetComponents<Behaviour>())
+        {
+            if (behaviour == null || behaviour == label ||
+                behaviour is LayoutElement || behaviour is ContentSizeFitter)
+                continue;
+            behaviour.enabled = false;
         }
     }
 
@@ -2992,27 +3426,37 @@ public sealed class Controller : MonoBehaviour
     private void RefreshVoiceLabel() => RefreshFeatureLabels();
 
     private string VoiceRestartLabel() =>
-        $"{T("本機語音自動重啟", "本地语音自动重启", "ローカル音声の自動再起動", "Local voice auto-restart")}: " +
-        (_settings.AutoStartVoiceService ? T("開啟", "开启", "オン", "On") : T("關閉", "关闭", "オフ", "Off")) +
-        $" · {VoiceStatusLabel()}";
+        T("本機語音自動重啟", "本地语音自动重启", "ローカル音声の自動再起動", "Local voice auto-restart");
+
+    [HideFromIl2Cpp]
+    private string VoiceSelectorValue(int index)
+    {
+        var mode = (VoiceMode)Math.Clamp(index, (int)VoiceMode.Off, (int)VoiceMode.Japanese);
+        var modeText = mode switch
+        {
+            VoiceMode.Off => T("關閉", "关闭", "オフ", "Off"),
+            VoiceMode.Chinese => T("中文", "中文", "中国語", "Chinese"),
+            VoiceMode.Japanese => T("日文", "日语", "日本語", "Japanese"),
+            _ => T("關閉", "关闭", "オフ", "Off"),
+        };
+        return $"{modeText} · {VoiceStatusLabel()}";
+    }
 
     [HideFromIl2Cpp]
     private void RefreshFeatureLabels()
     {
-        if (_trayProviderToggle?._nameText != null)
-            SetLabel(_trayProviderToggle._nameText, T("供應商", "提供商", "プロバイダー", "Provider"));
-        if (_trayModelToggle?._nameText != null)
-            SetLabel(_trayModelToggle._nameText, T("模型", "模型", "モデル", "Model"));
-        if (_trayVoiceToggle?._nameText != null)
-            SetLabel(_trayVoiceToggle._nameText, $"{T("語音", "语音", "音声", "Voice")} · {VoiceStatusLabel()}");
-        if (_trayProactiveToggle?._nameText != null)
-            SetLabel(_trayProactiveToggle._nameText, T("AI 主動說話", "AI 主动说话", "AIの自発会話", "Proactive AI"));
-        if (_trayProactiveChanceToggle?._nameText != null)
-            SetLabel(_trayProactiveChanceToggle._nameText, T("事件回應機率", "事件回应概率", "イベント反応率", "Event chance"));
-        if (_trayProactiveCooldownToggle?._nameText != null)
-            SetLabel(_trayProactiveCooldownToggle._nameText, T("最短冷卻", "最短冷却", "最短クールダウン", "Minimum cooldown"));
-        if (_trayVoiceRestartToggle?._nameText != null)
-            SetLabel(_trayVoiceRestartToggle._nameText, VoiceRestartLabel());
+        _trayProviderSelector?.SetTitle(T("供應商", "提供商", "プロバイダー", "Provider"));
+        _trayModelSelector?.SetTitle(T("模型", "模型", "モデル", "Model"));
+        _trayVoiceSelector?.SetTitle(T("語音模式", "语音模式", "音声モード", "Voice mode"));
+        _trayVoiceSelector?.SetOptions(VoiceSelectorOptions(), (int)_voiceMode);
+        _trayProactiveSwitch?.SetTitle(T("AI 主動說話", "AI 主动说话", "AIの自発会話", "Proactive AI"));
+        _trayProactiveSwitch?.SetValue(_settings.ProactiveDialogue, false);
+        _trayProactiveChanceSelector?.SetTitle(T("事件回應機率", "事件回应概率", "イベント反応率", "Event chance"));
+        _trayProactiveChanceSelector?.SetOptions(ProactiveChanceOptions(), ProactiveChanceIndex());
+        _trayProactiveCooldownSelector?.SetTitle(T("最短冷卻", "最短冷却", "最短クールダウン", "Minimum cooldown"));
+        _trayProactiveCooldownSelector?.SetOptions(ProactiveCooldownOptions(), ProactiveCooldownIndex());
+        _trayVoiceRestartSwitch?.SetTitle(VoiceRestartLabel());
+        _trayVoiceRestartSwitch?.SetValue(_settings.AutoStartVoiceService, false);
     }
 
     private string VoiceStatusLabel()
@@ -3059,16 +3503,16 @@ public sealed class Controller : MonoBehaviour
 
         if (_availableModels.Count > 0 && !_availableModels.Contains(_model))
             _model = _availableModels[0];
-        RefreshModelToggle();
+        RefreshModelSelector();
     }
 
     [HideFromIl2Cpp]
-    private void RefreshModelToggle()
+    private void RefreshModelSelector()
     {
-        if (_trayModelToggle == null)
+        if (_trayModelSelector == null)
             return;
-        InitializeNativeToggle(_trayModelToggle, T("模型", "模型", "モデル", "Model"),
-            ModelToggleOptions(), ModelToggleIndex(), ModelToggleChanged);
+        _trayModelSelector.SetTitle(T("模型", "模型", "モデル", "Model"));
+        _trayModelSelector.SetOptions(ModelSelectorOptions(), ModelSelectorIndex());
     }
 
     [HideFromIl2Cpp]
@@ -3081,8 +3525,7 @@ public sealed class Controller : MonoBehaviour
         _apiKey = _trayApiKeyInput?.text ?? _apiKey;
         _modelListFailed = false;
         _modelListRequest = AiClient.ListModelsAsync(_baseUrl, _apiKey, _settings.TimeoutSeconds, _lifetime!.Token);
-        if (_trayModelToggle?._nameText != null)
-            SetLabel(_trayModelToggle._nameText, T("模型載入中…", "模型加载中…", "モデルを読み込み中…", "Loading models…"));
+        RefreshModelSelector();
     }
 
     [HideFromIl2Cpp]
@@ -3101,14 +3544,13 @@ public sealed class Controller : MonoBehaviour
                     "API 沒有回傳模型", "API 没有返回模型", "APIからモデルが返されませんでした", "API returned no models"));
             if (!_availableModels.Contains(_model))
                 _model = _availableModels[0];
-            RefreshModelToggle();
+            RefreshModelSelector();
             SaveTraySettings();
         }
         catch (Exception exception)
         {
             _modelListFailed = true;
-            if (_trayModelToggle?._nameText != null)
-                SetLabel(_trayModelToggle._nameText, T("模型讀取失敗", "模型读取失败", "モデルの読み込みに失敗", "Failed to load models"));
+            RefreshModelSelector();
             Plugin.LogSource.LogWarning(exception.Message);
         }
         finally
@@ -3128,13 +3570,7 @@ public sealed class Controller : MonoBehaviour
         SetTrayRowVisible(_trayApiKeyInput, ProviderProfiles.NeedsApiKey(_provider));
         Canvas.ForceUpdateCanvases();
         if (_trayContent != null)
-        {
-            LayoutRebuilder.ForceRebuildLayoutImmediate(_trayContent);
-            var customRoot = _trayCustomRoot?.GetComponent<RectTransform>();
-            if (customRoot != null)
-                ApplyTrayCustomGeometry(_trayContent, customRoot, _trayAiNativeContentHeight);
-            ApplyTrayScroll();
-        }
+            RebuildTrayLayout(_trayContent, false);
     }
 
     [HideFromIl2Cpp]
@@ -3161,35 +3597,145 @@ public sealed class Controller : MonoBehaviour
 
         _lastTrayTab = _settingsView._currentTab;
         _trayCustomRoot?.SetActive(_lastTrayTab == TraySettingTab.Lilith);
+        _trayVoiceRoot?.SetActive(_lastTrayTab == TraySettingTab.Language);
         if (_lastTrayTab == TraySettingTab.Lilith)
         {
             RunOptionalStage(nameof(EnsureTraySettings), EnsureTraySettings);
             RefreshProviderRows();
+            if (_trayAiContent != null)
+                RebuildTrayLayout(_trayAiContent, true);
         }
+        else if (_lastTrayTab == TraySettingTab.Language)
+        {
+            RunOptionalStage(nameof(EnsureLanguageVoiceSettings), EnsureLanguageVoiceSettings);
+        }
+
+        // The game reuses one SettingView for every tab.  Rebuild the shared
+        // content after each tab transition so the native pages are anchored
+        // to the viewport top as well as the injected AI pages.
+        if (_trayContent != null)
+            RebuildTrayLayout(_trayContent, true);
     }
 
     [HideFromIl2Cpp]
     private void ApplyTrayScroll()
     {
-        if (!_trayScrollReady || _trayContent == null)
+        if (!_trayScrollReady || _trayContent == null || _trayViewport == null)
             return;
-        Canvas.ForceUpdateCanvases();
-        LayoutRebuilder.ForceRebuildLayoutImmediate(_trayContent);
+        var contentHeight = Math.Max(_trayContent.rect.height, LayoutUtility.GetPreferredHeight(_trayContent));
+        _trayScrollOffset = ClampTrayScrollOffset(_trayScrollOffset, contentHeight, _trayViewport.rect.height);
+        var position = _trayContent.anchoredPosition;
+        position.y = _trayContentTop + _trayScrollOffset;
+        _trayContent.anchoredPosition = position;
     }
 
     [HideFromIl2Cpp]
     private void ScrollTrayToTop()
     {
-        if (_trayScrollRect == null)
-            return;
-        Canvas.ForceUpdateCanvases();
-        _trayScrollRect.verticalNormalizedPosition = 1f;
+        _trayScrollOffset = 0f;
+        ApplyTrayScroll();
     }
 
     [HideFromIl2Cpp]
-    private static void NoOp()
+    private void ProcessTrayWheel() =>
+        HandleTrayWheel(Interlocked.Exchange(ref _trayWheelDelta, 0) / 120f);
+
+    [HideFromIl2Cpp]
+    private void HandleTrayWheel(float wheel)
     {
+        if (Math.Abs(wheel) < 0.01f || _settingsView == null || !_settingsView.IsVisible)
+            return;
+
+        var promptRect = _trayPromptInput?.GetComponent<RectTransform>();
+        if (promptRect != null && EventSystem.current != null &&
+            RectTransformUtility.RectangleContainsScreenPoint(promptRect, Input.mousePosition))
+        {
+            _trayWheelEventData ??= new PointerEventData(EventSystem.current);
+            _trayWheelEventData.scrollDelta = new Vector2(0f, wheel);
+            _trayPromptInput!.OnScroll(_trayWheelEventData);
+            return;
+        }
+
+        ScrollTray(wheel);
     }
+
+    [HideFromIl2Cpp]
+    private void ScrollTray(float wheel)
+    {
+        if (Math.Abs(wheel) < 0.01f || _trayContent == null || _trayViewport == null)
+            return;
+        if (!_trayWheelLogged)
+        {
+            _trayWheelLogged = true;
+            Plugin.LogSource.LogInfo($"Tray wheel ready: content={_trayContent.rect.height:0.#}, preferred={LayoutUtility.GetPreferredHeight(_trayContent):0.#}, viewport={_trayViewport.rect.height:0.#}");
+        }
+
+        _trayScrollOffset -= wheel * 35f;
+        ApplyTrayScroll();
+    }
+
+    [HideFromIl2Cpp]
+    private static float ClampTrayScrollOffset(float offset, float contentHeight, float viewportHeight) =>
+        Math.Clamp(offset, 0f, Math.Max(0f, contentHeight - viewportHeight));
+
+    [HideFromIl2Cpp]
+    private void EnsureTrayWheelHook()
+    {
+        if (_trayWindowHandle != IntPtr.Zero || _settingsView == null)
+            return;
+
+        var window = TransparentWindowNew.Hwnd;
+        if (window == IntPtr.Zero)
+            return;
+
+        _trayWindowProc = TrayWindowProc;
+        _trayWindowProcPointer = Marshal.GetFunctionPointerForDelegate(_trayWindowProc);
+        _previousWindowProc = GetWindowLongPtr(window, -4);
+        if (_previousWindowProc == IntPtr.Zero ||
+            SetWindowLongPtr(window, -4, _trayWindowProcPointer) == IntPtr.Zero)
+        {
+            Plugin.LogSource.LogWarning($"Could not enable tray mouse-wheel input: {Marshal.GetLastWin32Error()}");
+            _previousWindowProc = IntPtr.Zero;
+            _trayWindowProc = null;
+            return;
+        }
+
+        _trayWindowHandle = window;
+        Plugin.LogSource.LogInfo("Tray mouse-wheel input enabled");
+    }
+
+    [HideFromIl2Cpp]
+    private void RestoreTrayWheelHook()
+    {
+        if (_trayWindowHandle != IntPtr.Zero && _previousWindowProc != IntPtr.Zero &&
+            GetWindowLongPtr(_trayWindowHandle, -4) == _trayWindowProcPointer)
+            SetWindowLongPtr(_trayWindowHandle, -4, _previousWindowProc);
+
+        _trayWindowHandle = IntPtr.Zero;
+        _previousWindowProc = IntPtr.Zero;
+        _trayWindowProcPointer = IntPtr.Zero;
+        _trayWindowProc = null;
+        Interlocked.Exchange(ref _trayWheelDelta, 0);
+    }
+
+    private IntPtr TrayWindowProc(IntPtr window, uint message, IntPtr wParam, IntPtr lParam)
+    {
+        if (message == 0x020A)
+            Interlocked.Add(ref _trayWheelDelta, unchecked((short)(wParam.ToInt64() >> 16)));
+        return CallWindowProc(_previousWindowProc, window, message, wParam, lParam);
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate IntPtr WindowProc(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr SetWindowLongPtr(IntPtr window, int index, IntPtr value);
+
+    [DllImport("user32.dll", EntryPoint = "CallWindowProcW")]
+    private static extern IntPtr CallWindowProc(IntPtr previous, IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
 
     [HideFromIl2Cpp]
     private void SyncTraySettings()
@@ -3218,32 +3764,22 @@ public sealed class Controller : MonoBehaviour
     [HideFromIl2Cpp]
     private void RefreshLocalizedUi()
     {
-        if (_trayHeaderLabel != null)
-            SetLabel(_trayHeaderLabel, T("AI 莉莉絲聊天設定", "AI 莉莉丝聊天设置", "AI リリス チャット設定", "Lilith AI Chat Settings"));
-        if (_trayVoiceHeaderLabel != null)
-            SetLabel(_trayVoiceHeaderLabel, T("AI 語音設定", "AI 语音设置", "AI 音声設定", "Lilith AI Voice Settings"));
-        if (_trayProviderToggle != null)
-            InitializeNativeToggle(_trayProviderToggle, T("供應商", "提供商", "プロバイダー", "Provider"),
-                ProviderToggleOptions(), Array.IndexOf(Enum.GetValues<ProviderKind>(), _provider), ProviderToggleChanged);
-        RefreshModelToggle();
-        if (_trayVoiceToggle != null)
-            InitializeNativeToggle(_trayVoiceToggle, T("語音", "语音", "音声", "Voice"),
-                VoiceToggleOptions(), (int)_voiceMode, VoiceToggleChanged);
-        if (_trayProactiveChanceToggle != null)
-            InitializeNativeToggle(_trayProactiveChanceToggle, T("事件回應機率", "事件回应概率", "イベント反応率", "Event chance"),
-                ProactiveChanceToggleOptions(), ProactiveChanceIndex(), ProactiveChanceToggleChanged);
-        if (_trayProactiveCooldownToggle != null)
-            InitializeNativeToggle(_trayProactiveCooldownToggle, T("最短冷卻", "最短冷却", "最短クールダウン", "Minimum cooldown"),
-                ProactiveCooldownToggleOptions(), ProactiveCooldownIndex(), ProactiveCooldownToggleChanged);
+        _trayProviderSelector?.SetTitle(T("供應商", "提供商", "プロバイダー", "Provider"));
+        _trayProviderSelector?.SetOptions(ProviderSelectorOptions(), Array.IndexOf(Enum.GetValues<ProviderKind>(), _provider));
+        RefreshModelSelector();
+        _trayVoiceSelector?.SetTitle(T("語音模式", "语音模式", "音声モード", "Voice mode"));
+        _trayVoiceSelector?.SetOptions(VoiceSelectorOptions(), (int)_voiceMode);
+        _trayProactiveSwitch?.SetTitle(T("AI 主動說話", "AI 主动说话", "AIの自発会話", "Proactive AI"));
+        _trayProactiveSwitch?.SetValue(_settings.ProactiveDialogue, false);
+        _trayProactiveChanceSelector?.SetTitle(T("事件回應機率", "事件回应概率", "イベント反応率", "Event chance"));
+        _trayProactiveChanceSelector?.SetOptions(ProactiveChanceOptions(), ProactiveChanceIndex());
+        _trayProactiveCooldownSelector?.SetTitle(T("最短冷卻", "最短冷却", "最短クールダウン", "Minimum cooldown"));
+        _trayProactiveCooldownSelector?.SetOptions(ProactiveCooldownOptions(), ProactiveCooldownIndex());
+        _trayVoiceRestartSwitch?.SetTitle(VoiceRestartLabel());
+        _trayVoiceRestartSwitch?.SetValue(_settings.AutoStartVoiceService, false);
         SetTrayInputLabel(_trayBaseUrlInput, T("API 位址", "API 地址", "API URL", "API URL"));
         SetTrayInputLabel(_trayApiKeyInput, "API Key");
         SetTrayInputLabel(_trayPromptInput, T("莉莉絲角色設定", "莉莉丝角色设定", "リリスのキャラクター設定", "Lilith Character Prompt"));
-        RefreshFeatureLabels();
-
-        if (_trayModelToggle?._nameText != null && _modelListRequest != null)
-            SetLabel(_trayModelToggle._nameText, T("模型載入中…", "模型加载中…", "モデルを読み込み中…", "Loading models…"));
-        else if (_trayModelToggle?._nameText != null && _modelListFailed)
-            SetLabel(_trayModelToggle._nameText, T("模型讀取失敗", "模型读取失败", "モデルの読み込みに失敗", "Failed to load models"));
 
         if (_chatRoot != null && _chatTitle != null)
             SetLabel(_chatTitle, T("對莉莉絲說", "和莉莉丝说话", "リリスに話しかける", "Talk to Lilith"));
@@ -3292,6 +3828,14 @@ public sealed class Controller : MonoBehaviour
                 RefreshProviderRows();
                 ScrollTrayToTop();
             }
+            else if (_settingsView._currentTab == TraySettingTab.Language)
+            {
+                RunOptionalStage(nameof(EnsureLanguageVoiceSettings), EnsureLanguageVoiceSettings);
+                _trayVoiceRoot?.SetActive(true);
+                ScrollTrayToTop();
+            }
+            if (_trayContent != null)
+                RebuildTrayLayout(_trayContent, true);
         }
         else if (!visible && _trayWasVisible)
             SyncTraySettings();

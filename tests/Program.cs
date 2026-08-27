@@ -120,6 +120,8 @@ if (clothingReply.Clothing != "Pajamas" || memoryReply.Memory != "玩家喜歡�
     AiCommandProtocol.TryParseAlarm("2026-07-23T09:00:00", now, out _))
     throw new InvalidOperationException("Chat command protocol self-test failed");
 if (AiCommandProtocol.ResolveExplicitClothing("Tell me about pajamas", "Pajamas sound comfortable.", "Pajamas") != "None" ||
+    AiCommandProtocol.ResolveExplicitClothing("可以換衣服嗎", "我幫你換成睡衣", "Pajamas") != "Pajamas" ||
+    AiCommandProtocol.ResolveExplicitClothing("我們換個話題聊衣服", "睡衣很舒服", "Pajamas") != "None" ||
     AiCommandProtocol.ResolveExplicitClothing("Please switch to casual clothes", "Sure, I will change into casual clothes.", "Casual") != "Casual" ||
     AiCommandProtocol.ResolveCommand("Please set a timer for 25 minutes", "SetTimer") != "SetTimer" ||
     AiCommandProtocol.ResolveCommand("I used a timer yesterday", "SetTimer") != "None" ||
@@ -199,6 +201,29 @@ if (!ProviderProfiles.IsSelfHosted(ProviderKind.Ollama) || ProviderProfiles.IsSe
     throw new InvalidOperationException("Provider profile self-test failed");
 if (!ProviderProfiles.DefaultPrompt.Contains("草莓蛋糕"))
     throw new InvalidOperationException("Character prompt self-test failed");
+var normalizationWarnings = new List<string>();
+var traditional = DisplayLanguage.NormalizeChinese("一点还吗", "zh-HK", normalizationWarnings.Add);
+var simplified = DisplayLanguage.NormalizeChinese("一點還嗎", "zh-CN", normalizationWarnings.Add);
+if (OperatingSystem.IsWindows())
+{
+    if (traditional != "一點還嗎" || simplified != "一点还吗" ||
+        DisplayLanguage.NormalizeChinese("こんにちは", "ja-JP") != "こんにちは" ||
+        DisplayLanguage.NormalizeChinese("English", "en-US") != "English")
+        throw new InvalidOperationException("Windows Chinese display normalization self-test failed");
+}
+else if (traditional != "一点还吗" || simplified != "一點還嗎" || normalizationWarnings.Count == 0)
+{
+    throw new InvalidOperationException("Non-Windows display normalization fallback self-test failed");
+}
+var normalizedReply = DisplayLanguage.NormalizeReply(new AiReply("一点还吗", "None", "一點還嗎", Memory: "一点"), "zh-HK");
+if (OperatingSystem.IsWindows() &&
+    (normalizedReply.Text != "一點還嗎" || normalizedReply.Speech != "一點還嗎" || normalizedReply.Memory != "一點"))
+    throw new InvalidOperationException("AI display reply normalization self-test failed");
+var safeError = AiClient.SafeProviderErrorSummary("{\"error\":{\"code\":\"invalid_request\",\"message\":\"Bearer secret-value sk-abcdefghijklmnopqrstuvwxyz\"}}");
+if (safeError.Length > 240 || !safeError.Contains("code=invalid_request") ||
+    safeError.Contains("secret-value", StringComparison.OrdinalIgnoreCase) ||
+    safeError.Contains("abcdefghijklmnopqrstuvwxyz", StringComparison.OrdinalIgnoreCase))
+    throw new InvalidOperationException("Provider error redaction self-test failed");
 using (var chinese = JsonDocument.Parse(TtsClient.BuildPayloadJson(VoiceMode.Chinese, "你好", "calm.wav")))
     if (chinese.RootElement.GetProperty("text_lang").GetString() != "zh" ||
         chinese.RootElement.GetProperty("ref_audio_path").GetString() != "calm.wav")
@@ -346,6 +371,7 @@ static async Task TestMissingSpeechRetry()
     if (reply.Speech != "おやすみ" || logs.Count(log => log.StartsWith("AI REQUEST")) != 2 ||
         !logs.Any(log => log.Contains("omitted Japanese speech")) ||
         !logs.Any(log => log.Contains("previous response omitted speech")) ||
+        logs.Any(log => log.Contains("\"reasoning\"")) ||
         !logs.Any(log => log.Contains("\"response_format\":{\"type\":\"json_schema\"")) ||
         !logs.Any(log => log.Contains("\"minLength\":1")) ||
         !logs.Any(log => log.Contains("\"provider\":{\"require_parameters\":true}")))

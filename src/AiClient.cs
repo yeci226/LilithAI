@@ -355,7 +355,7 @@ public static class AiCommandProtocol
     {
         var requested = RequestedClothing(userText);
         if (requested == "None")
-            return "None";
+            return IsClothingChangeRequest(userText) ? ResolveClothing(string.Empty, string.Empty, aiClothing) : "None";
         return string.Equals(aiClothing, requested, StringComparison.OrdinalIgnoreCase) ||
                RequestedClothing(replyText) == requested
             ? requested
@@ -409,15 +409,22 @@ public static class AiCommandProtocol
     private static string RequestedClothing(string text)
     {
         var request = (text ?? string.Empty).Trim().ToLowerInvariant();
-        var changeRequested = new[] { "換", "换", "穿上", "換上", "换上", "可以穿", "能穿", "想穿", "請穿", "请穿", "change", "switch", "put on", "wear", "着替", "着て", "変え" }
-            .Any(request.Contains);
-        if (!changeRequested)
+        if (!IsClothingChangeRequest(request))
             return "None";
         if (new[] { "睡衣", "パジャマ", "寝巻", "pajama", "pyjama" }.Any(request.Contains))
             return "Pajamas";
         return new[] { "便服", "休閒服", "休闲服", "日常服", "普段着", "私服", "casual" }.Any(request.Contains)
             ? "Casual"
             : "None";
+    }
+
+    private static bool IsClothingChangeRequest(string text)
+    {
+        var request = (text ?? string.Empty).Trim().ToLowerInvariant();
+        if (new[] { "換個話題", "换个话题", "換話題", "换话题", "change the subject", "switch topics", "switch the topic" }.Any(request.Contains))
+            return false;
+        return new[] { "換", "换", "穿上", "換上", "换上", "可以穿", "能穿", "想穿", "請穿", "请穿", "change", "switch", "put on", "wear", "着替", "着て", "変え" }.Any(request.Contains) &&
+               new[] { "衣服", "衣物", "服裝", "服装", "換裝", "换装", "睡衣", "便服", "休閒服", "休闲服", "日常服", "outfit", "clothes", "clothing", "pajama", "pyjama", "casual", "パジャマ", "寝巻", "普段着", "私服", "着替" }.Any(request.Contains);
     }
 
     public static bool TryParseTimerSeconds(string argument, out float seconds)
@@ -643,9 +650,10 @@ public static class AiClient
 
             if (!response.IsSuccessStatusCode)
             {
+                var errorSummary = SafeProviderErrorSummary(body);
                 if (speechFallback)
                 {
-                    log?.Invoke($"AI SPEECH FALLBACK\nSpeech request failed with HTTP {(int)response.StatusCode}; text chat continues without TTS.");
+                    log?.Invoke($"AI SPEECH FALLBACK\nSpeech request failed with HTTP {(int)response.StatusCode}; {errorSummary}; text chat continues without TTS.");
                     return replyNeedingSpeech!;
                 }
                 if (attempt == 0 && IsRetryableStatusCode((int)response.StatusCode))
@@ -655,7 +663,7 @@ public static class AiClient
                     await Task.Delay(RetryDelay(response), timeout.Token).ConfigureAwait(false);
                     continue;
                 }
-                throw new InvalidOperationException($"API {(int)response.StatusCode}: provider request failed");
+                throw new InvalidOperationException($"API {(int)response.StatusCode}: {errorSummary}");
             }
 
             string? finishReason = null;
@@ -742,6 +750,55 @@ public static class AiClient
     public static bool IsRetryableStatusCode(int statusCode) =>
         statusCode is 408 or 425 or 429 || statusCode is >= 500 and <= 599;
 
+    public static string SafeProviderErrorSummary(string? body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+            return "provider returned no error details";
+
+        string? code = null;
+        string? message = null;
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            var root = document.RootElement;
+            var error = root.TryGetProperty("error", out var nested) && nested.ValueKind == JsonValueKind.Object
+                ? nested
+                : root;
+            code = ScalarErrorValue(error, "code");
+            message = ScalarErrorValue(error, "message") ?? ScalarErrorValue(root, "message");
+        }
+        catch (JsonException)
+        {
+        }
+
+        var summary = string.Join("; ", new[]
+        {
+            string.IsNullOrWhiteSpace(code) ? null : $"code={code}",
+            string.IsNullOrWhiteSpace(message) ? null : $"message={message}",
+        }.Where(value => value != null));
+        return string.IsNullOrWhiteSpace(summary)
+            ? "provider returned an unstructured error"
+            : Trim(SanitizeErrorText(summary), 240);
+    }
+
+    private static string? ScalarErrorValue(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var value))
+            return null;
+        return value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False => value.ToString(),
+            _ => null,
+        };
+    }
+
+    private static string SanitizeErrorText(string value)
+    {
+        var compact = new string(value.Select(character => char.IsControl(character) ? ' ' : character).ToArray());
+        return Regex.Replace(compact, @"(?i)(bearer\s+|sk-[A-Za-z0-9_-]{8,})\S*", "[redacted]").Trim();
+    }
+
     private static bool IsResponseShapeException(Exception exception) =>
         exception is JsonException or KeyNotFoundException or InvalidOperationException;
 
@@ -803,7 +860,7 @@ public static class AiClient
         using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"API {(int)response.StatusCode}: {Trim(body, 240)}");
+            throw new InvalidOperationException($"API {(int)response.StatusCode}: {SafeProviderErrorSummary(body)}");
 
         using var json = JsonDocument.Parse(body);
         return json.RootElement.GetProperty("data").EnumerateArray()
@@ -841,7 +898,8 @@ public static class AiClient
         };
         if (SupportsJsonObject(provider, model))
             payload["response_format"] = new { type = "json_object" };
-        if (provider == ProviderKind.OpenRouter)
+        if (provider == ProviderKind.OpenRouter &&
+            !model.Equals("openrouter/free", StringComparison.OrdinalIgnoreCase))
             payload["reasoning"] = new { effort = "none", exclude = true };
         if (provider == ProviderKind.OpenRouter &&
             (model.Equals("openrouter/auto", StringComparison.OrdinalIgnoreCase) ||

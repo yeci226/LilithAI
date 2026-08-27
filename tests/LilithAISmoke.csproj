@@ -9,5 +9,6 @@
     <Compile Include="..\src\AiClient.cs" Link="AiClient.cs" />
     <Compile Include="..\src\ConfigMigration.cs" Link="ConfigMigration.cs" />
     <Compile Include="..\src\TtsClient.cs" Link="TtsClient.cs" />
+    <Compile Include="..\src\DisplayLanguage.cs" Link="DisplayLanguage.cs" />
   </ItemGroup>
 </Project>
